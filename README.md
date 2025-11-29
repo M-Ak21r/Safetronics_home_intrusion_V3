@@ -82,8 +82,9 @@ python theft_detection.py --video input.mp4 --output output.mp4
 
 ### 5. Visualization
 - Green boxes/markers for assets
+- Green boxes for authorized personnel (with name displayed)
 - Red boxes for identified thieves
-- Blue boxes for regular persons
+- Blue boxes for unknown persons
 - Status overlay with frame info and alerts
 
 ## Adding Authorized Personnel
