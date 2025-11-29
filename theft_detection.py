@@ -12,11 +12,10 @@ Tech Stack:
 Author: Safetronics
 """
 
-import os
 import time
 import logging
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import cv2
@@ -582,7 +581,8 @@ class TheftDetectionSystem:
                 asset_state.frames_since_seen += 1
                 
                 # Check for theft event (Ghost Protocol)
-                if asset_state.frames_since_seen == FRAMES_UNTIL_THEFT + 1:
+                # Trigger exactly when threshold is reached (e.g., 30 frames = ~1s at 30fps)
+                if asset_state.frames_since_seen == FRAMES_UNTIL_THEFT:
                     assets_to_check.append((asset_id, asset_state))
         
         # Handle theft events
