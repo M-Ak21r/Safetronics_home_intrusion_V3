@@ -1,0 +1,6 @@
+# Safetronics Home Intrusion Detection System - Dependencies
+# Install with: pip install -r requirements.txt
+
+face_recognition>=1.3.0
+opencv-python>=4.5.0
+numpy>=1.19.0
