@@ -575,7 +575,9 @@ class TheftDetectionSystem:
                             self.person_states[temp_id] = PersonState(
                                 bbox=(x1, y1, x2, y2),
                                 centroid=centroid,
-                                is_thief=False
+                                is_thief=False,
+                                is_authorized=False,
+                                authorized_name=None
                             )
                         continue
                     
