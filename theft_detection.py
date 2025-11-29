@@ -49,13 +49,22 @@ AUTHORIZED_PERSONNEL_DIR = "./authorized_personnel"
 class AssetState:
     """State tracking for a single asset (Phone or Laptop)."""
     last_seen_pos: tuple[float, float]
+    class_id: int  # Required: YOLO class ID (67 for Cell Phone, 63 for Laptop)
     frames_since_seen: int = 0
-    class_id: int = 0
     
 
 @dataclass
 class PersonState:
-    """State tracking for a detected person."""
+    """
+    State tracking for a detected person.
+    
+    The is_thief flag persists across frames once set. It is set when:
+    - A theft event identifies this person as a suspect (Ghost Protocol)
+    - Periodic face scanning matches against the Thief Ledger
+    
+    The flag is never automatically reset to allow re-identification of thieves
+    who leave and re-enter the frame.
+    """
     bbox: tuple[int, int, int, int]  # x1, y1, x2, y2
     centroid: tuple[float, float]
     face_encoding: Optional[np.ndarray] = None
@@ -103,8 +112,8 @@ class TheftDetectionSystem:
         # Person tracking: {track_id: PersonState}
         self.person_states: dict[int, PersonState] = {}
         
-        # Known thief face encodings for re-identification
-        self.known_thief_encodings: list[np.ndarray] = []
+        # Track IDs of persons confirmed as thieves (persists across frames)
+        self.confirmed_thief_track_ids: set[int] = set()
         
         # Frame counter for periodic face scanning
         self.frame_count = 0
@@ -292,8 +301,9 @@ class TheftDetectionSystem:
         
         if face_encoding is None:
             logger.info(f"Could not extract face from suspect {suspect_id}")
-            # Mark as potential thief anyway
+            # Mark as potential thief anyway (track by ID since face unavailable)
             suspect.is_thief = True
+            self.confirmed_thief_track_ids.add(suspect_id)
             return f"THEFT DETECTED - Suspect {suspect_id} (face not captured)"
         
         # Biometric Cross-Check
@@ -309,12 +319,14 @@ class TheftDetectionSystem:
             logger.critical(f"REPEAT OFFENDER detected! Thief #{thief_index + 1}")
             suspect.is_thief = True
             suspect.face_encoding = face_encoding
+            self.confirmed_thief_track_ids.add(suspect_id)
             return f"ALERT: REPEAT OFFENDER - Thief #{thief_index + 1}"
         else:
             # New thief - add to ledger
             self.thief_ledger.append(face_encoding)
             suspect.is_thief = True
             suspect.face_encoding = face_encoding
+            self.confirmed_thief_track_ids.add(suspect_id)
             logger.critical(f"NEW THIEF detected and added to ledger. Total thieves: {len(self.thief_ledger)}")
             return f"ALERT: NEW THIEF DETECTED - Added to Ledger (#{len(self.thief_ledger)})"
     
@@ -347,6 +359,7 @@ class TheftDetectionSystem:
             if is_known_thief:
                 person_state.is_thief = True
                 person_state.face_encoding = face_encoding
+                self.confirmed_thief_track_ids.add(track_id)
                 alerts.append(f"KNOWN THIEF #{thief_index + 1} RE-IDENTIFIED")
                 logger.warning(f"Known thief #{thief_index + 1} re-identified as person {track_id}")
         
@@ -511,11 +524,24 @@ class TheftDetectionSystem:
                     
                     # Get track ID if available
                     track_id = None
-                    if boxes.id is not None:
+                    if boxes.id is not None and i < len(boxes.id):
                         track_id = int(boxes.id[i].cpu().numpy())
-                    else:
-                        # Generate a temporary ID based on position
-                        track_id = hash((int(x1), int(y1), cls_id)) % 10000
+                    
+                    # Skip detections without valid track IDs for asset tracking
+                    # (consistent tracking requires valid IDs from YOLO tracker)
+                    if track_id is None:
+                        # For persons, we can still use them for proximity calculations
+                        # but they won't persist thief status across frames
+                        if cls_id == CLASS_PERSON:
+                            # Use frame-local ID for this person
+                            temp_id = -(i + 1)  # Negative IDs for untracked persons
+                            centroid = self._calculate_centroid((x1, y1, x2, y2))
+                            self.person_states[temp_id] = PersonState(
+                                bbox=(x1, y1, x2, y2),
+                                centroid=centroid,
+                                is_thief=False
+                            )
+                        continue
                     
                     centroid = self._calculate_centroid((x1, y1, x2, y2))
                     
@@ -539,12 +565,9 @@ class TheftDetectionSystem:
                         # Person detection
                         current_person_ids.add(track_id)
                         
-                        # Check if this person was previously identified as a thief
-                        is_known_thief = False
-                        if self.thief_ledger:
-                            face_enc = self._extract_face_encoding(frame, (x1, y1, x2, y2))
-                            if face_enc is not None:
-                                is_known_thief, _ = self._is_in_thief_ledger(face_enc)
+                        # Check if this person was previously confirmed as a thief
+                        # Uses track ID persistence (no face encoding per frame)
+                        is_known_thief = track_id in self.confirmed_thief_track_ids
                         
                         self.person_states[track_id] = PersonState(
                             bbox=(x1, y1, x2, y2),
