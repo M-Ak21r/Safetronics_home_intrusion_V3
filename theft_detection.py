@@ -73,6 +73,7 @@ class PersonState:
     centroid: tuple[float, float]
     face_encoding: Optional[np.ndarray] = None
     is_thief: bool = False
+    authorized_name: Optional[str] = None  # Name of authorized personnel
     
 
 class TheftDetectionSystem:
@@ -121,6 +122,9 @@ class TheftDetectionSystem:
         
         # Track IDs of persons confirmed as thieves (persists across frames)
         self.confirmed_thief_track_ids: set[int] = set()
+        
+        # Track authorized personnel names by track_id (persists across frames)
+        self.authorized_person_names: dict[int, str] = {}
         
         # Frame counter for periodic face scanning
         self.frame_count = 0
@@ -254,17 +258,27 @@ class TheftDetectionSystem:
         encodings = face_recognition.face_encodings(rgb_region, face_locations)
         return encodings[0] if encodings else None
     
-    def _is_in_safe_list(self, face_encoding: np.ndarray) -> bool:
-        """Check if face encoding matches any authorized personnel."""
+    def _is_in_safe_list(self, face_encoding: np.ndarray) -> tuple[bool, Optional[str]]:
+        """
+        Check if face encoding matches any authorized personnel.
+        
+        Returns:
+            Tuple of (is_match, person_name) where name is None if no match
+        """
         if not self.safe_list:
-            return False
+            return False, None
         
         matches = face_recognition.compare_faces(
             self.safe_list,
             face_encoding,
             tolerance=FACE_MATCH_TOLERANCE
         )
-        return any(matches)
+        
+        for i, match in enumerate(matches):
+            if match:
+                return True, self.safe_list_names[i]
+        
+        return False, None
     
     def _is_in_thief_ledger(self, face_encoding: np.ndarray) -> tuple[bool, int]:
         """
@@ -447,9 +461,12 @@ class TheftDetectionSystem:
         
         # Biometric Cross-Check
         # Check 1: Whitelist (Safe List)
-        if self._is_in_safe_list(face_encoding):
-            logger.info(f"Person {suspect_id} is authorized personnel")
-            return "Authorized Movement Detected"
+        is_authorized, auth_name = self._is_in_safe_list(face_encoding)
+        if is_authorized:
+            suspect.authorized_name = auth_name
+            self.authorized_person_names[suspect_id] = auth_name
+            logger.info(f"Person {suspect_id} is authorized personnel: {auth_name}")
+            return f"Authorized Movement: {auth_name}"
         
         # Check 2: Thief Ledger
         is_known_thief, thief_index = self._is_in_thief_ledger(face_encoding)
@@ -485,14 +502,24 @@ class TheftDetectionSystem:
             return alerts
         
         for track_id, person_state in self.person_states.items():
-            if person_state.is_thief:
-                continue  # Already identified
+            # Skip if already identified as thief or authorized
+            if person_state.is_thief or track_id in self.authorized_person_names:
+                continue
             
             face_encoding = self._extract_face_encoding(frame, person_state.bbox)
             
             if face_encoding is None:
                 continue
             
+            # Check if authorized personnel first
+            is_authorized, auth_name = self._is_in_safe_list(face_encoding)
+            if is_authorized:
+                self.authorized_person_names[track_id] = auth_name
+                person_state.authorized_name = auth_name
+                logger.info(f"Authorized personnel identified: {auth_name} (Track ID: {track_id})")
+                continue
+            
+            # Check if known thief
             is_known_thief, thief_index = self._is_in_thief_ledger(face_encoding)
             
             if is_known_thief:
@@ -545,27 +572,43 @@ class TheftDetectionSystem:
                     2
                 )
         
-        # Draw persons
+        # Draw persons with dynamic labels
         for track_id, person_state in self.person_states.items():
             x1, y1, x2, y2 = [int(coord) for coord in person_state.bbox]
             
+            # Determine label and color based on person status
             if person_state.is_thief:
                 # Red box for thieves
-                color = (0, 0, 255)
+                color = (0, 0, 255)  # BGR: Red
                 label = f"THIEF {track_id}"
+            elif person_state.authorized_name:
+                # Green box for authorized personnel with their actual name
+                color = (0, 255, 0)  # BGR: Green
+                label = f"{person_state.authorized_name} (Staff)"
             else:
-                # Blue box for regular persons
-                color = (255, 0, 0)
+                # Blue box for unknown persons
+                color = (255, 0, 0)  # BGR: Blue
                 label = f"Person {track_id}"
             
+            # Draw bounding box
             cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
+            
+            # Draw label with background for better visibility
+            label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+            cv2.rectangle(
+                annotated_frame,
+                (x1, y1 - label_size[1] - 10),
+                (x1 + label_size[0], y1),
+                color,
+                -1  # Filled rectangle
+            )
             cv2.putText(
                 annotated_frame,
                 label,
                 (x1, y1 - 10),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
-                color,
+                (255, 255, 255),  # White text on colored background
                 2
             )
         
@@ -695,7 +738,8 @@ class TheftDetectionSystem:
                             self.person_states[temp_id] = PersonState(
                                 bbox=(x1, y1, x2, y2),
                                 centroid=centroid,
-                                is_thief=False
+                                is_thief=False,
+                                authorized_name=None
                             )
                         continue
                     
@@ -725,10 +769,14 @@ class TheftDetectionSystem:
                         # Uses track ID persistence (no face encoding per frame)
                         is_known_thief = track_id in self.confirmed_thief_track_ids
                         
+                        # Restore authorized name from persistent dict if available
+                        auth_name = self.authorized_person_names.get(track_id, None)
+                        
                         self.person_states[track_id] = PersonState(
                             bbox=(x1, y1, x2, y2),
                             centroid=centroid,
-                            is_thief=is_known_thief
+                            is_thief=is_known_thief,
+                            authorized_name=auth_name
                         )
         
         # Update frames_since_seen for missing assets
