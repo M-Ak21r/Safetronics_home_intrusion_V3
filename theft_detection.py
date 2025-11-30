@@ -96,7 +96,7 @@ class TheftDetectionSystem:
         authorized_dir: str = AUTHORIZED_PERSONNEL_DIR,
         camera_source: int = 1,
         evidence_dir: str = THEFT_EVIDENCE_DIR,
-        arduino_port: Optional[str] = None,
+        arduino_port: Optional[str] = "COM11",
         arduino_baudrate: int = 9600
     ):
         """
