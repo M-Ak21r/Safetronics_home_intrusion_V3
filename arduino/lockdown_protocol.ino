@@ -75,5 +75,11 @@ void loop() {
         currentState = STATE_OPEN;
       }
     }
+    
+    // Clear any remaining characters in the serial buffer
+    // to prevent processing stale or noise data
+    while (Serial.available() > 0) {
+      Serial.read();
+    }
   }
 }
