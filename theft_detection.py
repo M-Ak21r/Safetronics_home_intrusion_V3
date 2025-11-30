@@ -17,6 +17,7 @@ import logging
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional
+from datetime import datetime
 
 import cv2
 import numpy as np
@@ -42,6 +43,10 @@ FRAMES_UNTIL_THEFT = 30  # Approx 1 second buffer at 30fps
 FACE_RECOGNITION_INTERVAL = 30  # Run face recognition every N frames
 FACE_MATCH_TOLERANCE = 0.6  # Tolerance for face matching
 AUTHORIZED_PERSONNEL_DIR = "./authorized_personnel"
+CAPTURED_VIDEO = "./capture"
+THEFT_EVIDENCE_DIR = "./theft_evidence"  # Directory to save theft evidence
+VIDEO_BUFFER_SECONDS = 5  # Seconds of video to buffer before theft
+VIDEO_RECORD_AFTER_SECONDS = 10  # Seconds to record after theft detection
 
 
 @dataclass
@@ -82,7 +87,8 @@ class TheftDetectionSystem:
         self,
         model_path: str = "yolo11n.pt",
         authorized_dir: str = AUTHORIZED_PERSONNEL_DIR,
-        camera_source: int = 0
+        camera_source: int = 1,
+        evidence_dir: str = THEFT_EVIDENCE_DIR
     ):
         """
         Initialize the theft detection system.
@@ -91,6 +97,7 @@ class TheftDetectionSystem:
             model_path: Path to the YOLO model weights
             authorized_dir: Directory containing authorized personnel face images
             camera_source: Camera device index
+            evidence_dir: Directory to save theft evidence (images/videos)
         """
         logger.info("Initializing Theft Detection System...")
         
@@ -120,6 +127,20 @@ class TheftDetectionSystem:
         
         # Camera source
         self.camera_source = camera_source
+        
+        # Evidence capture setup
+        self.evidence_dir = Path(evidence_dir)
+        self.evidence_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Frame buffer for pre-theft video capture
+        self.frame_buffer: list[np.ndarray] = []
+        self.buffer_max_frames = 0  # Will be set based on FPS
+        
+        # Video recording state
+        self.is_recording_theft = False
+        self.video_writer: Optional[cv2.VideoWriter] = None
+        self.recording_frames_remaining = 0
+        self.current_theft_timestamp = None
         
         logger.info("System initialized successfully")
     
@@ -267,6 +288,83 @@ class TheftDetectionSystem:
         
         return False, -1
     
+    def _capture_theft_evidence(self, frame: np.ndarray, suspect_id: int, theft_timestamp: str) -> None:
+        """
+        Capture and save theft evidence (image snapshots).
+        
+        Args:
+            frame: Current video frame
+            suspect_id: Track ID of the suspect
+            theft_timestamp: Timestamp identifier for this theft event
+        """
+        try:
+            # Save full frame
+            full_frame_path = self.evidence_dir / f"theft_{theft_timestamp}_fullframe.jpg"
+            cv2.imwrite(str(full_frame_path), frame)
+            logger.info(f"Saved theft evidence: {full_frame_path}")
+            
+            # Save cropped suspect image if available
+            if suspect_id in self.person_states:
+                suspect = self.person_states[suspect_id]
+                x1, y1, x2, y2 = [int(coord) for coord in suspect.bbox]
+                
+                # Ensure coordinates are within frame bounds
+                h, w = frame.shape[:2]
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(w, x2), min(h, y2)
+                
+                if x2 > x1 and y2 > y1:
+                    suspect_crop = frame[y1:y2, x1:x2]
+                    crop_path = self.evidence_dir / f"theft_{theft_timestamp}_suspect_{suspect_id}.jpg"
+                    cv2.imwrite(str(crop_path), suspect_crop)
+                    logger.info(f"Saved suspect image: {crop_path}")
+        
+        except Exception as e:
+            logger.error(f"Failed to capture theft evidence: {e}")
+    
+    def _start_theft_video_recording(self, theft_timestamp: str, fps: float, frame_size: tuple[int, int]) -> None:
+        """
+        Start recording video of the theft event.
+        
+        Args:
+            theft_timestamp: Timestamp identifier for this theft event
+            fps: Frames per second for the video
+            frame_size: (width, height) of the video frames
+        """
+        try:
+            video_path = self.evidence_dir / f"theft_{theft_timestamp}.mp4"
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            self.video_writer = cv2.VideoWriter(str(video_path), fourcc, fps, frame_size)
+            
+            if not self.video_writer.isOpened():
+                logger.error("Failed to open video writer")
+                return
+            
+            # Write buffered frames (pre-theft footage)
+            for buffered_frame in self.frame_buffer:
+                self.video_writer.write(buffered_frame)
+            
+            self.is_recording_theft = True
+            self.recording_frames_remaining = int(fps * VIDEO_RECORD_AFTER_SECONDS)
+            self.current_theft_timestamp = theft_timestamp
+            
+            logger.info(f"Started theft video recording: {video_path}")
+        
+        except Exception as e:
+            logger.error(f"Failed to start video recording: {e}")
+            self.is_recording_theft = False
+    
+    def _stop_theft_video_recording(self) -> None:
+        """Stop recording the theft video."""
+        if self.video_writer:
+            self.video_writer.release()
+            self.video_writer = None
+            logger.info(f"Stopped theft video recording: theft_{self.current_theft_timestamp}.mp4")
+        
+        self.is_recording_theft = False
+        self.recording_frames_remaining = 0
+        self.current_theft_timestamp = None
+    
     def _find_closest_person(
         self,
         asset_pos: tuple[float, float]
@@ -298,7 +396,8 @@ class TheftDetectionSystem:
         self,
         frame: np.ndarray,
         asset_id: int,
-        asset_state: AssetState
+        asset_state: AssetState,
+        fps: float = 30.0
     ) -> Optional[str]:
         """
         Handle a potential theft event (Ghost Protocol).
@@ -307,20 +406,34 @@ class TheftDetectionSystem:
             frame: Current video frame
             asset_id: Track ID of the missing asset
             asset_state: State of the missing asset
+            fps: Current video FPS for evidence recording
             
         Returns:
             Status message or None
         """
         logger.warning(f"Theft event detected! Asset {asset_id} missing for {asset_state.frames_since_seen} frames")
         
+        # Generate unique theft timestamp
+        theft_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        
         # Find the closest person (suspect)
         suspect_id = self._find_closest_person(asset_state.last_seen_pos)
         
         if suspect_id is None:
             logger.info("No persons in frame to identify as suspect")
+            # Still capture evidence of the theft event
+            self._capture_theft_evidence(frame, -1, theft_timestamp)
             return "THEFT DETECTED - No suspect visible"
         
         suspect = self.person_states[suspect_id]
+        
+        # Capture evidence immediately
+        self._capture_theft_evidence(frame, suspect_id, theft_timestamp)
+        
+        # Start video recording
+        h, w = frame.shape[:2]
+        if not self.is_recording_theft:
+            self._start_theft_video_recording(theft_timestamp, fps, (w, h))
         
         # Extract face for biometric check
         face_encoding = self._extract_face_encoding(frame, suspect.bbox)
@@ -506,18 +619,35 @@ class TheftDetectionSystem:
         
         return annotated_frame
     
-    def process_frame(self, frame: np.ndarray) -> tuple[np.ndarray, list[str]]:
+    def process_frame(self, frame: np.ndarray, fps: float = 30.0) -> tuple[np.ndarray, list[str]]:
         """
         Process a single video frame.
         
         Args:
             frame: Video frame to process
+            fps: Frames per second (for video recording timing)
             
         Returns:
             Tuple of (annotated_frame, alert_messages)
         """
         self.frame_count += 1
         alerts = []
+        
+        # Initialize frame buffer size based on FPS (only once)
+        if self.buffer_max_frames == 0:
+            self.buffer_max_frames = int(fps * VIDEO_BUFFER_SECONDS)
+        
+        # Add current frame to buffer
+        self.frame_buffer.append(frame.copy())
+        if len(self.frame_buffer) > self.buffer_max_frames:
+            self.frame_buffer.pop(0)
+        
+        # Write frame to theft video if recording
+        if self.is_recording_theft and self.video_writer:
+            self.video_writer.write(frame)
+            self.recording_frames_remaining -= 1
+            if self.recording_frames_remaining <= 0:
+                self._stop_theft_video_recording()
         
         # Run YOLO tracking
         results = self.model.track(
@@ -614,7 +744,7 @@ class TheftDetectionSystem:
         
         # Handle theft events
         for asset_id, asset_state in assets_to_check:
-            theft_alert = self._handle_theft_event(frame, asset_id, asset_state)
+            theft_alert = self._handle_theft_event(frame, asset_id, asset_state, fps)
             if theft_alert:
                 alerts.append(theft_alert)
         
@@ -643,6 +773,9 @@ class TheftDetectionSystem:
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         cap.set(cv2.CAP_PROP_FPS, 30)
         
+        # Get actual FPS
+        actual_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        
         logger.info("Press 'q' to quit")
         
         fps_start_time = time.time()
@@ -658,7 +791,7 @@ class TheftDetectionSystem:
                     continue
                 
                 # Process frame
-                annotated_frame, alerts = self.process_frame(frame)
+                annotated_frame, alerts = self.process_frame(frame, actual_fps)
                 
                 # Calculate FPS
                 fps_frame_count += 1
@@ -692,6 +825,10 @@ class TheftDetectionSystem:
                     break
         
         finally:
+            # Stop any ongoing theft recording
+            if self.is_recording_theft:
+                self._stop_theft_video_recording()
+            
             cap.release()
             cv2.destroyAllWindows()
             logger.info("System shutdown complete")
@@ -734,7 +871,7 @@ class TheftDetectionSystem:
                     break
                 
                 # Process frame
-                annotated_frame, alerts = self.process_frame(frame)
+                annotated_frame, alerts = self.process_frame(frame, fps)
                 
                 # Write to output
                 if out:
@@ -787,7 +924,7 @@ def main():
     parser.add_argument(
         "--camera",
         type=int,
-        default=0,
+        default=1,
         help="Camera device index (default: 0)"
     )
     parser.add_argument(
@@ -799,7 +936,7 @@ def main():
     parser.add_argument(
         "--output",
         type=str,
-        default=None,
+        default=CAPTURED_VIDEO,
         help="Path to save output video (only with --video)"
     )
     
