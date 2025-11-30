@@ -98,8 +98,9 @@ class TheftDetectionSystem:
         logger.info(f"Loading YOLO model from {model_path}")
         self.model = YOLO(model_path)
         
-        # Initialize Safe List (authorized personnel face encodings)
+        # Initialize Safe List (authorized personnel face encodings and names)
         self.safe_list: list[np.ndarray] = []
+        self.safe_list_names: list[str] = []
         self._load_authorized_personnel(authorized_dir)
         
         # Initialize Thief Ledger (confirmed suspect face encodings)
@@ -126,8 +127,18 @@ class TheftDetectionSystem:
         """
         Load face encodings from authorized personnel images.
         
+        Supports nested directory structure where each sub-directory represents
+        a person and contains multiple reference images:
+        
+        ./authorized_personnel/
+        ├── Elon Musk/
+        │   ├── image1.jpg
+        │   └── profile.png
+        ├── Sundar Pichai/
+        │   └── headshot.jpg
+        
         Args:
-            directory: Path to directory containing face images
+            directory: Path to directory containing person sub-directories with face images
         """
         dir_path = Path(directory)
         if not dir_path.exists():
@@ -136,20 +147,34 @@ class TheftDetectionSystem:
         
         image_extensions = {'.jpg', '.jpeg', '.png', '.bmp'}
         
-        for img_file in dir_path.iterdir():
-            if img_file.suffix.lower() in image_extensions:
-                try:
-                    image = face_recognition.load_image_file(str(img_file))
-                    encodings = face_recognition.face_encodings(image)
-                    if encodings:
-                        self.safe_list.append(encodings[0])
-                        logger.info(f"Loaded authorized face from {img_file.name}")
-                    else:
-                        logger.warning(f"No face found in {img_file.name}")
-                except Exception as e:
-                    logger.error(f"Failed to load {img_file.name}: {e}")
+        # Iterate through sub-directories (each represents a person)
+        for person_dir in dir_path.iterdir():
+            if person_dir.is_dir():
+                person_name = person_dir.name
+                images_loaded = 0
+                
+                # Iterate through all image files in the person's directory
+                for img_file in person_dir.iterdir():
+                    if img_file.is_file() and img_file.suffix.lower() in image_extensions:
+                        try:
+                            image = face_recognition.load_image_file(str(img_file))
+                            encodings = face_recognition.face_encodings(image)
+                            if encodings:
+                                self.safe_list.append(encodings[0])
+                                self.safe_list_names.append(person_name)
+                                images_loaded += 1
+                                logger.info(f"Loaded face encoding from {img_file.name} for '{person_name}'")
+                            else:
+                                logger.warning(f"No face found in {img_file.name} for '{person_name}'")
+                        except Exception as e:
+                            logger.error(f"Failed to load {img_file.name} for '{person_name}': {e}")
+                
+                if images_loaded > 0:
+                    logger.info(f"Loaded {images_loaded} face encoding(s) for '{person_name}'")
+                else:
+                    logger.warning(f"No valid face encodings found for '{person_name}'")
         
-        logger.info(f"Safe List initialized with {len(self.safe_list)} authorized faces")
+        logger.info(f"Safe List initialized with {len(self.safe_list)} authorized face encodings")
     
     def _calculate_centroid(self, bbox: tuple[int, int, int, int]) -> tuple[float, float]:
         """Calculate centroid of a bounding box."""
