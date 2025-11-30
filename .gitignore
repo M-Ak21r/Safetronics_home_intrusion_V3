@@ -12,6 +12,8 @@ build/
 develop-eggs/
 dist/
 downloads/
+./authorized_personnel/
+./theft_evidence/
 eggs/
 .eggs/
 lib/
