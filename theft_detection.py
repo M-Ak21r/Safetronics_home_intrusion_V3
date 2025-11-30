@@ -24,6 +24,12 @@ import numpy as np
 import face_recognition
 from ultralytics import YOLO
 
+try:
+    import serial
+    SERIAL_AVAILABLE = True
+except ImportError:
+    SERIAL_AVAILABLE = False
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -89,7 +95,9 @@ class TheftDetectionSystem:
         model_path: str = "yolo11n.pt",
         authorized_dir: str = AUTHORIZED_PERSONNEL_DIR,
         camera_source: int = 1,
-        evidence_dir: str = THEFT_EVIDENCE_DIR
+        evidence_dir: str = THEFT_EVIDENCE_DIR,
+        arduino_port: Optional[str] = None,
+        arduino_baudrate: int = 9600
     ):
         """
         Initialize the theft detection system.
@@ -99,6 +107,8 @@ class TheftDetectionSystem:
             authorized_dir: Directory containing authorized personnel face images
             camera_source: Camera device index
             evidence_dir: Directory to save theft evidence (images/videos)
+            arduino_port: Serial port for Arduino connection (e.g., '/dev/ttyUSB0', 'COM3')
+            arduino_baudrate: Baud rate for Arduino serial communication (default: 9600)
         """
         logger.info("Initializing Theft Detection System...")
         
@@ -146,7 +156,56 @@ class TheftDetectionSystem:
         self.recording_frames_remaining = 0
         self.current_theft_timestamp = None
         
+        # Arduino serial connection for lockdown mechanism
+        self.arduino_serial: Optional[serial.Serial] = None
+        self._init_arduino_connection(arduino_port, arduino_baudrate)
+        
         logger.info("System initialized successfully")
+    
+    def _init_arduino_connection(self, port: Optional[str], baudrate: int) -> None:
+        """
+        Initialize serial connection with Arduino for lockdown mechanism.
+        
+        Args:
+            port: Serial port for Arduino (e.g., '/dev/ttyUSB0', 'COM3')
+            baudrate: Baud rate for serial communication
+        """
+        if port is None:
+            logger.info("No Arduino port specified. Lockdown mechanism disabled.")
+            return
+        
+        if not SERIAL_AVAILABLE:
+            logger.warning("pyserial not installed. Lockdown mechanism disabled. Install with: pip install pyserial")
+            return
+        
+        try:
+            self.arduino_serial = serial.Serial(port, baudrate, timeout=1)
+            logger.info(f"Arduino connected on {port} at {baudrate} baud")
+        except serial.SerialException as e:
+            logger.warning(f"Failed to connect to Arduino on {port}: {e}. Lockdown mechanism disabled.")
+            self.arduino_serial = None
+        except Exception as e:
+            logger.warning(f"Unexpected error connecting to Arduino: {e}. Lockdown mechanism disabled.")
+            self.arduino_serial = None
+    
+    def _trigger_lockdown(self) -> None:
+        """
+        Send lockdown signal to Arduino to activate door lock mechanism.
+        
+        Sends a single byte 'L' to the Arduino to trigger immediate lockdown.
+        This method is called synchronously when a theft is confirmed.
+        """
+        if self.arduino_serial is None:
+            logger.warning("Lockdown signal not sent: Arduino not connected")
+            return
+        
+        try:
+            self.arduino_serial.write(b'L')
+            logger.critical("LOCKDOWN SIGNAL SENT")
+        except serial.SerialException as e:
+            logger.error(f"Failed to send lockdown signal: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error sending lockdown signal: {e}")
     
     def _load_authorized_personnel(self, directory: str) -> None:
         """
@@ -457,6 +516,8 @@ class TheftDetectionSystem:
             # Mark as potential thief anyway (track by ID since face unavailable)
             suspect.is_thief = True
             self.confirmed_thief_track_ids.add(suspect_id)
+            # Trigger lockdown immediately
+            self._trigger_lockdown()
             return f"THEFT DETECTED - Suspect {suspect_id} (face not captured)"
         
         # Biometric Cross-Check
@@ -476,6 +537,8 @@ class TheftDetectionSystem:
             suspect.is_thief = True
             suspect.face_encoding = face_encoding
             self.confirmed_thief_track_ids.add(suspect_id)
+            # Trigger lockdown immediately
+            self._trigger_lockdown()
             return f"ALERT: REPEAT OFFENDER - Thief #{thief_index + 1}"
         else:
             # New thief - add to ledger
@@ -484,6 +547,8 @@ class TheftDetectionSystem:
             suspect.face_encoding = face_encoding
             self.confirmed_thief_track_ids.add(suspect_id)
             logger.critical(f"NEW THIEF detected and added to ledger. Total thieves: {len(self.thief_ledger)}")
+            # Trigger lockdown immediately
+            self._trigger_lockdown()
             return f"ALERT: NEW THIEF DETECTED - Added to Ledger (#{len(self.thief_ledger)})"
     
     def _periodic_thief_scan(self, frame: np.ndarray) -> list[str]:
