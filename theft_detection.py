@@ -160,6 +160,8 @@ class TheftDetectionSystem:
                             image = face_recognition.load_image_file(str(img_file))
                             encodings = face_recognition.face_encodings(image)
                             if encodings:
+                                if len(encodings) > 1:
+                                    logger.warning(f"Multiple faces ({len(encodings)}) found in {img_file.name} for '{person_name}', using first face only")
                                 self.safe_list.append(encodings[0])
                                 self.safe_list_names.append(person_name)
                                 images_loaded += 1
