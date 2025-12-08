@@ -14,6 +14,8 @@ Author: Safetronics
 
 import time
 import logging
+import pickle
+import os
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional
@@ -49,6 +51,7 @@ FRAMES_UNTIL_THEFT = 30  # Approx 1 second buffer at 30fps
 FACE_RECOGNITION_INTERVAL = 30  # Run face recognition every N frames
 FACE_MATCH_TOLERANCE = 0.6  # Tolerance for face matching
 AUTHORIZED_PERSONNEL_DIR = "./authorized_personnel"
+ENCODINGS_CACHE_FILE = "encodings.pickle"  # Cache file for face encodings
 CAPTURED_VIDEO = "./capture"
 THEFT_EVIDENCE_DIR = "./theft_evidence"  # Directory to save theft evidence
 VIDEO_BUFFER_SECONDS = 5  # Seconds of video to buffer before theft
@@ -211,6 +214,10 @@ class TheftDetectionSystem:
         """
         Load face encodings from authorized personnel images.
         
+        Implements an Embedding Caching Layer for performance optimization:
+        - Fast Path: Loads pre-computed encodings from cache file
+        - Slow Path: Computes encodings from images and caches them
+        
         Supports nested directory structure where each sub-directory represents
         a person and contains multiple reference images:
         
@@ -229,6 +236,25 @@ class TheftDetectionSystem:
             logger.warning(f"Authorized personnel directory '{directory}' not found. Safe List is empty.")
             return
         
+        # Define cache file path
+        cache_path = dir_path / ENCODINGS_CACHE_FILE
+        
+        # Fast Path: Load from cache if exists
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, 'rb') as cache_file:
+                    cached_data = pickle.load(cache_file)
+                    self.safe_list = cached_data['encodings']
+                    self.safe_list_names = cached_data['names']
+                logger.info(f"Loaded encodings from cache: {len(self.safe_list)} face encodings")
+                return
+            except (pickle.UnpicklingError, EOFError, KeyError, ValueError) as e:
+                logger.warning(f"Cache file corrupted or invalid: {e}. Falling back to slow path.")
+            except Exception as e:
+                logger.warning(f"Failed to load cache: {e}. Falling back to slow path.")
+        
+        # Slow Path: Compute encodings from images
+        logger.info("Computing face encodings from images (this may take a moment)...")
         image_extensions = {'.jpg', '.jpeg', '.png', '.bmp'}
         
         # Iterate through sub-directories (each represents a person)
@@ -261,6 +287,19 @@ class TheftDetectionSystem:
                     logger.warning(f"No valid face encodings found for '{person_name}'")
         
         logger.info(f"Safe List initialized with {len(self.safe_list)} authorized face encodings")
+        
+        # Serialize encodings to cache for next boot
+        if len(self.safe_list) > 0:
+            try:
+                cache_data = {
+                    'encodings': self.safe_list,
+                    'names': self.safe_list_names
+                }
+                with open(cache_path, 'wb') as cache_file:
+                    pickle.dump(cache_data, cache_file)
+                logger.info(f"Cached {len(self.safe_list)} encodings to {cache_path}")
+            except Exception as e:
+                logger.error(f"Failed to cache encodings: {e}")
     
     def _calculate_centroid(self, bbox: tuple[int, int, int, int]) -> tuple[float, float]:
         """Calculate centroid of a bounding box."""
