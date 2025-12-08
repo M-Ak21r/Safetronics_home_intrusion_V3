@@ -77,3 +77,6 @@ Thumbs.db
 
 # Output videos
 output*.mp4
+
+# Face encodings cache
+encodings.pickle
