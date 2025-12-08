@@ -214,9 +214,9 @@ class TheftDetectionSystem:
         """
         Load face encodings from authorized personnel images.
         
-        Implements an Embedding Caching Layer for performance optimization:
-        - Fast Path: Loads pre-computed encodings from cache file
-        - Slow Path: Computes encodings from images and caches them
+        Implements an embedding caching layer for performance optimization:
+        - Fast path: Loads pre-computed encodings from cache file
+        - Slow path: Computes encodings from images and caches them
         
         Supports nested directory structure where each sub-directory represents
         a person and contains multiple reference images:
@@ -245,7 +245,7 @@ class TheftDetectionSystem:
         # Define cache file path
         cache_path = dir_path / ENCODINGS_CACHE_FILE
         
-        # Fast Path: Load from cache if exists
+        # Fast path: Load from cache if exists
         if cache_path.exists():
             try:
                 with cache_path.open('rb') as cache_file:
@@ -259,7 +259,7 @@ class TheftDetectionSystem:
             except Exception as e:
                 logger.warning(f"Failed to load cache: {e}. Falling back to slow path.")
         
-        # Slow Path: Compute encodings from images
+        # Slow path: Compute encodings from images
         logger.info("Computing face encodings from images (this may take a moment)...")
         image_extensions = {'.jpg', '.jpeg', '.png', '.bmp'}
         
@@ -305,7 +305,7 @@ class TheftDetectionSystem:
                     pickle.dump(cache_data, cache_file)
                 logger.info(f"Cached {len(self.safe_list)} encodings to {cache_path}")
             except Exception as e:
-                logger.error(f"Failed to cache encodings: {e}")
+                logger.error(f"Failed to write encodings cache to {cache_path}: {e}. Next boot will recompute encodings.")
     
     def _calculate_centroid(self, bbox: tuple[int, int, int, int]) -> tuple[float, float]:
         """Calculate centroid of a bounding box."""
