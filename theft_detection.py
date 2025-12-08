@@ -2,11 +2,11 @@
 Theft Detection MVP - Production-Grade System
 =============================================
 A real-time theft detection system using YOLO11n for object detection/tracking
-and face_recognition for biometric verification.
+and InsightFace (ArcFace) for biometric verification.
 
 Tech Stack:
 - Vision Core: ultralytics (YOLO11n) for object detection & tracking
-- Biometrics: face_recognition (dlib) and opencv
+- Biometrics: insightface (ArcFace) and opencv
 - Math: numpy for vector calculations
 
 Author: Safetronics
@@ -21,7 +21,7 @@ from datetime import datetime
 
 import cv2
 import numpy as np
-import face_recognition
+from insightface.app import FaceAnalysis
 from ultralytics import YOLO
 
 try:
@@ -47,7 +47,7 @@ TRACKED_CLASSES = {CLASS_PERSON, CLASS_CELL_PHONE, CLASS_LAPTOP}
 # Configuration constants
 FRAMES_UNTIL_THEFT = 30  # Approx 1 second buffer at 30fps
 FACE_RECOGNITION_INTERVAL = 30  # Run face recognition every N frames
-FACE_MATCH_TOLERANCE = 0.6  # Tolerance for face matching
+FACE_SIMILARITY_THRESHOLD = 0.5  # Cosine similarity threshold for face matching (ArcFace)
 AUTHORIZED_PERSONNEL_DIR = "./authorized_personnel"
 CAPTURED_VIDEO = "./capture"
 THEFT_EVIDENCE_DIR = "./theft_evidence"  # Directory to save theft evidence
@@ -115,6 +115,17 @@ class TheftDetectionSystem:
         # Load YOLO model
         logger.info(f"Loading YOLO model from {model_path}")
         self.model = YOLO(model_path)
+        
+        # Initialize InsightFace
+        logger.info("Initializing InsightFace (ArcFace) for face recognition...")
+        self.app = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+        try:
+            self.app.prepare(ctx_id=0, det_size=(640, 640))
+            logger.info("InsightFace initialized with GPU acceleration")
+        except Exception as e:
+            logger.warning(f"GPU initialization failed ({e}), falling back to CPU")
+            self.app.prepare(ctx_id=-1, det_size=(640, 640))
+            logger.info("InsightFace initialized with CPU")
         
         # Initialize Safe List (authorized personnel face encodings and names)
         self.safe_list: list[np.ndarray] = []
@@ -209,7 +220,7 @@ class TheftDetectionSystem:
     
     def _load_authorized_personnel(self, directory: str) -> None:
         """
-        Load face encodings from authorized personnel images.
+        Load face encodings from authorized personnel images using InsightFace.
         
         Supports nested directory structure where each sub-directory represents
         a person and contains multiple reference images:
@@ -241,12 +252,25 @@ class TheftDetectionSystem:
                 for img_file in person_dir.iterdir():
                     if img_file.is_file() and img_file.suffix.lower() in image_extensions:
                         try:
-                            image = face_recognition.load_image_file(str(img_file))
-                            encodings = face_recognition.face_encodings(image)
-                            if encodings:
-                                if len(encodings) > 1:
-                                    logger.warning(f"Multiple faces ({len(encodings)}) found in {img_file.name} for '{person_name}', using first face only")
-                                self.safe_list.append(encodings[0])
+                            # Load image with OpenCV
+                            image = cv2.imread(str(img_file))
+                            if image is None:
+                                logger.warning(f"Failed to load image {img_file.name} for '{person_name}'")
+                                continue
+                            
+                            # Convert BGR to RGB for InsightFace
+                            rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                            
+                            # Detect faces using InsightFace
+                            faces = self.app.get(rgb_image)
+                            
+                            if faces:
+                                if len(faces) > 1:
+                                    logger.warning(f"Multiple faces ({len(faces)}) found in {img_file.name} for '{person_name}', using first face only")
+                                
+                                # Use normalized embedding from the first face
+                                embedding = faces[0].normed_embedding
+                                self.safe_list.append(embedding)
                                 self.safe_list_names.append(person_name)
                                 images_loaded += 1
                                 logger.info(f"Loaded face encoding from {img_file.name} for '{person_name}'")
@@ -281,14 +305,18 @@ class TheftDetectionSystem:
         bbox: tuple[int, int, int, int]
     ) -> Optional[np.ndarray]:
         """
-        Extract face encoding from a person's bounding box region.
+        Extract face encoding from a person's bounding box region using InsightFace.
+        
+        Implements Anatomical Filtering to reject faces detected on torso/t-shirts:
+        - Only accepts faces in the top half of the person crop (cy <= 0.5 * crop_height)
+        - Selects the largest valid face from the top-half region
         
         Args:
             frame: The current video frame
             bbox: Person's bounding box (x1, y1, x2, y2)
             
         Returns:
-            Face encoding array or None if no face detected
+            Normalized face embedding array or None if no valid face detected
         """
         x1, y1, x2, y2 = [int(coord) for coord in bbox]
         
@@ -300,26 +328,54 @@ class TheftDetectionSystem:
         if x2 <= x1 or y2 <= y1:
             return None
         
-        # Extract person region
-        person_region = frame[y1:y2, x1:x2]
+        # Extract person region (crop)
+        person_crop = frame[y1:y2, x1:x2]
         
-        if person_region.size == 0:
+        if person_crop.size == 0:
             return None
         
-        # Convert BGR to RGB for face_recognition
-        rgb_region = cv2.cvtColor(person_region, cv2.COLOR_BGR2RGB)
+        # Get crop dimensions
+        crop_height, crop_width = person_crop.shape[:2]
         
-        # Detect and encode faces
-        face_locations = face_recognition.face_locations(rgb_region)
-        if not face_locations:
+        # Convert BGR to RGB for InsightFace
+        rgb_crop = cv2.cvtColor(person_crop, cv2.COLOR_BGR2RGB)
+        
+        # Detect faces using InsightFace
+        faces = self.app.get(rgb_crop)
+        
+        if not faces:
             return None
         
-        encodings = face_recognition.face_encodings(rgb_region, face_locations)
-        return encodings[0] if encodings else None
+        # Anatomical Filtering: Reject faces on torso/t-shirts
+        valid_faces = []
+        for face in faces:
+            # Get face bounding box center relative to the crop
+            face_bbox = face.bbox  # [x1, y1, x2, y2]
+            cx = (face_bbox[0] + face_bbox[2]) / 2
+            cy = (face_bbox[1] + face_bbox[3]) / 2
+            
+            # Reject faces where cy > 0.5 * crop_height (bottom half = torso region)
+            if cy <= 0.5 * crop_height:
+                # Calculate face area for size comparison
+                face_area = (face_bbox[2] - face_bbox[0]) * (face_bbox[3] - face_bbox[1])
+                valid_faces.append((face, face_area))
+        
+        if not valid_faces:
+            return None
+        
+        # Select the largest valid face from top-half only
+        largest_face = max(valid_faces, key=lambda x: x[1])[0]
+        
+        # Return normalized embedding (InsightFace embeddings are typically already normalized)
+        embedding = largest_face.normed_embedding
+        return embedding
     
     def _is_in_safe_list(self, face_encoding: np.ndarray) -> tuple[bool, Optional[str]]:
         """
-        Check if face encoding matches any authorized personnel.
+        Check if face encoding matches any authorized personnel using cosine similarity.
+        
+        Args:
+            face_encoding: Normalized face embedding from InsightFace
         
         Returns:
             Tuple of (is_match, person_name) where name is None if no match
@@ -327,21 +383,21 @@ class TheftDetectionSystem:
         if not self.safe_list:
             return False, None
         
-        matches = face_recognition.compare_faces(
-            self.safe_list,
-            face_encoding,
-            tolerance=FACE_MATCH_TOLERANCE
-        )
-        
-        for i, match in enumerate(matches):
-            if match:
+        # Calculate cosine similarity with all safe list embeddings
+        # Since embeddings are normalized, dot product = cosine similarity
+        for i, safe_encoding in enumerate(self.safe_list):
+            similarity = np.dot(face_encoding, safe_encoding)
+            if similarity >= FACE_SIMILARITY_THRESHOLD:
                 return True, self.safe_list_names[i]
         
         return False, None
     
     def _is_in_thief_ledger(self, face_encoding: np.ndarray) -> tuple[bool, int]:
         """
-        Check if face encoding matches any known thief.
+        Check if face encoding matches any known thief using cosine similarity.
+        
+        Args:
+            face_encoding: Normalized face embedding from InsightFace
         
         Returns:
             Tuple of (is_match, index) where index is -1 if no match
@@ -349,14 +405,11 @@ class TheftDetectionSystem:
         if not self.thief_ledger:
             return False, -1
         
-        matches = face_recognition.compare_faces(
-            self.thief_ledger,
-            face_encoding,
-            tolerance=FACE_MATCH_TOLERANCE
-        )
-        
-        for i, match in enumerate(matches):
-            if match:
+        # Calculate cosine similarity with all thief ledger embeddings
+        # Since embeddings are normalized, dot product = cosine similarity
+        for i, thief_encoding in enumerate(self.thief_ledger):
+            similarity = np.dot(face_encoding, thief_encoding)
+            if similarity >= FACE_SIMILARITY_THRESHOLD:
                 return True, i
         
         return False, -1
