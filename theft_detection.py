@@ -47,7 +47,12 @@ TRACKED_CLASSES = {CLASS_PERSON, CLASS_CELL_PHONE, CLASS_LAPTOP}
 # Configuration constants
 FRAMES_UNTIL_THEFT = 30  # Approx 1 second buffer at 30fps
 FACE_RECOGNITION_INTERVAL = 30  # Run face recognition every N frames
-FACE_SIMILARITY_THRESHOLD = 0.5  # Cosine similarity threshold for face matching (ArcFace)
+# Cosine similarity threshold for face matching with ArcFace embeddings
+# 0.5 is intentionally lower than typical thresholds (0.6-0.8) to account for:
+# - Side profiles and difficult angles during theft events
+# - Varying lighting conditions in security scenarios
+# - Better recall for identifying potential threats (adjustable based on false positive rate)
+FACE_SIMILARITY_THRESHOLD = 0.5
 AUTHORIZED_PERSONNEL_DIR = "./authorized_personnel"
 CAPTURED_VIDEO = "./capture"
 THEFT_EVIDENCE_DIR = "./theft_evidence"  # Directory to save theft evidence
