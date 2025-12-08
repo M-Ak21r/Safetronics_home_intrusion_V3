@@ -341,7 +341,11 @@ class TheftDetectionSystem:
         rgb_crop = cv2.cvtColor(person_crop, cv2.COLOR_BGR2RGB)
         
         # Detect faces using InsightFace
-        faces = self.app.get(rgb_crop)
+        try:
+            faces = self.app.get(rgb_crop)
+        except Exception as e:
+            logger.warning(f"Face detection failed: {e}")
+            return None
         
         if not faces:
             return None
@@ -383,12 +387,17 @@ class TheftDetectionSystem:
         if not self.safe_list:
             return False, None
         
-        # Calculate cosine similarity with all safe list embeddings
+        # Calculate cosine similarity with all safe list embeddings at once
         # Since embeddings are normalized, dot product = cosine similarity
-        for i, safe_encoding in enumerate(self.safe_list):
-            similarity = np.dot(face_encoding, safe_encoding)
-            if similarity >= FACE_SIMILARITY_THRESHOLD:
-                return True, self.safe_list_names[i]
+        safe_embeddings = np.array(self.safe_list)
+        similarities = np.dot(safe_embeddings, face_encoding)
+        
+        # Find the best match
+        max_idx = np.argmax(similarities)
+        max_similarity = similarities[max_idx]
+        
+        if max_similarity >= FACE_SIMILARITY_THRESHOLD:
+            return True, self.safe_list_names[max_idx]
         
         return False, None
     
@@ -405,12 +414,17 @@ class TheftDetectionSystem:
         if not self.thief_ledger:
             return False, -1
         
-        # Calculate cosine similarity with all thief ledger embeddings
+        # Calculate cosine similarity with all thief ledger embeddings at once
         # Since embeddings are normalized, dot product = cosine similarity
-        for i, thief_encoding in enumerate(self.thief_ledger):
-            similarity = np.dot(face_encoding, thief_encoding)
-            if similarity >= FACE_SIMILARITY_THRESHOLD:
-                return True, i
+        thief_embeddings = np.array(self.thief_ledger)
+        similarities = np.dot(thief_embeddings, face_encoding)
+        
+        # Find the best match
+        max_idx = np.argmax(similarities)
+        max_similarity = similarities[max_idx]
+        
+        if max_similarity >= FACE_SIMILARITY_THRESHOLD:
+            return True, max_idx
         
         return False, -1
     
