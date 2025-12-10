@@ -58,6 +58,7 @@ CAPTURED_VIDEO = "./capture"
 THEFT_EVIDENCE_DIR = "./theft_evidence"  # Directory to save theft evidence
 VIDEO_BUFFER_SECONDS = 5  # Seconds of video to buffer before theft
 VIDEO_RECORD_AFTER_SECONDS = 10  # Seconds to record after theft detection
+THREAD_SHUTDOWN_TIMEOUT = 5.0  # Seconds to wait for thread shutdown
 
 
 class EvidenceWriter(threading.Thread):
@@ -116,7 +117,7 @@ class EvidenceWriter(threading.Thread):
         """Signal the thread to stop and wait for it to finish."""
         self._stop_event.set()
         self.queue.put(None)  # Sentinel value to unblock queue.get()
-        self.join(timeout=5.0)  # Wait up to 5 seconds for thread to finish
+        self.join(timeout=THREAD_SHUTDOWN_TIMEOUT)
 
 
 @dataclass
