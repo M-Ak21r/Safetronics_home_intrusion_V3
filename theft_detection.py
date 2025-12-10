@@ -2,11 +2,11 @@
 Theft Detection MVP - Production-Grade System
 =============================================
 A real-time theft detection system using YOLO11n for object detection/tracking
-and face_recognition for biometric verification.
+and InsightFace (ArcFace) for biometric verification.
 
 Tech Stack:
 - Vision Core: ultralytics (YOLO11n) for object detection & tracking
-- Biometrics: face_recognition (dlib) and opencv
+- Biometrics: insightface (ArcFace) and opencv
 - Math: numpy for vector calculations
 
 Author: Safetronics
@@ -23,7 +23,7 @@ from datetime import datetime
 
 import cv2
 import numpy as np
-import face_recognition
+from insightface.app import FaceAnalysis
 from ultralytics import YOLO
 
 try:
@@ -49,9 +49,9 @@ TRACKED_CLASSES = {CLASS_PERSON, CLASS_CELL_PHONE, CLASS_LAPTOP}
 # Configuration constants
 FRAMES_UNTIL_THEFT = 30  # Approx 1 second buffer at 30fps
 FACE_RECOGNITION_INTERVAL = 30  # Run face recognition every N frames
-FACE_MATCH_TOLERANCE = 0.6  # Tolerance for face matching
+FACE_SIMILARITY_THRESHOLD = 0.5  # Cosine similarity threshold for face matching
 AUTHORIZED_PERSONNEL_DIR = "./authorized_personnel"
-ENCODINGS_CACHE_FILE = "encodings.pickle"  # Cache file for face encodings
+ENCODINGS_CACHE_FILE = "encodings.pkl"  # Cache file for centroid face encodings
 CAPTURED_VIDEO = "./capture"
 THEFT_EVIDENCE_DIR = "./theft_evidence"  # Directory to save theft evidence
 VIDEO_BUFFER_SECONDS = 5  # Seconds of video to buffer before theft
@@ -114,6 +114,27 @@ class TheftDetectionSystem:
             arduino_baudrate: Baud rate for Arduino serial communication (default: 9600)
         """
         logger.info("Initializing Theft Detection System...")
+        
+        # Initialize InsightFace FaceAnalysis
+        logger.info("Initializing InsightFace (ArcFace) model...")
+        try:
+            self.app = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+        except Exception as e:
+            logger.error(f"Failed to initialize InsightFace model: {e}")
+            raise RuntimeError(f"Could not load InsightFace buffalo_l model. Please ensure insightface is properly installed: {e}")
+        
+        try:
+            # Try GPU first (ctx_id=0), fallback to CPU (ctx_id=-1)
+            self.app.prepare(ctx_id=0, det_size=(640, 640))
+            logger.info("InsightFace initialized with GPU acceleration")
+        except Exception as e:
+            logger.warning(f"GPU initialization failed: {e}. Falling back to CPU.")
+            try:
+                self.app.prepare(ctx_id=-1, det_size=(640, 640))
+                logger.info("InsightFace initialized with CPU")
+            except Exception as e:
+                logger.error(f"Failed to prepare InsightFace model: {e}")
+                raise RuntimeError(f"Could not prepare InsightFace model for inference: {e}")
         
         # Load YOLO model
         logger.info(f"Loading YOLO model from {model_path}")
@@ -212,15 +233,17 @@ class TheftDetectionSystem:
     
     def _load_authorized_personnel(self, directory: str) -> None:
         """
-        Load face encodings from authorized personnel images.
+        Load face encodings from authorized personnel images with centroid embeddings.
         
-        Implements an embedding caching layer for performance optimization:
-        - Fast path: Loads pre-computed encodings from cache file
-        - Slow path: Computes encodings from images and caches them
+        Implements centroid embedding optimization for performance:
+        - Fast Boot: Loads pre-computed centroid encodings from encodings.pkl
+        - Slow Boot: Computes mean embedding (centroid) for each person directory
         
-        Supports nested directory structure where each sub-directory represents
-        a person and contains multiple reference images:
+        Each person directory can contain multiple reference images. The system
+        computes the centroid (mean) of all embeddings for that person, normalizes it,
+        and stores one representative embedding per person.
         
+        Directory structure:
         ./authorized_personnel/
         ├── Elon Musk/
         │   ├── image1.jpg
@@ -245,56 +268,76 @@ class TheftDetectionSystem:
         # Define cache file path
         cache_path = dir_path / ENCODINGS_CACHE_FILE
         
-        # Fast path: Load from cache if exists
+        # Fast Boot: Load from cache if exists
         if cache_path.exists():
             try:
                 with cache_path.open('rb') as cache_file:
                     cached_data = pickle.load(cache_file)
                     self.safe_list = cached_data['encodings']
                     self.safe_list_names = cached_data['names']
-                logger.info(f"Loaded encodings from cache: {len(self.safe_list)} face encodings")
+                logger.info(f"Fast Boot: Loaded {len(self.safe_list)} centroid encodings from cache")
                 return
             except (pickle.UnpicklingError, EOFError, KeyError, ValueError) as e:
-                logger.warning(f"Cache file corrupted or invalid: {e}. Falling back to slow path.")
+                logger.warning(f"Cache file corrupted or invalid: {e}. Falling back to Slow Boot.")
             except Exception as e:
-                logger.warning(f"Failed to load cache: {e}. Falling back to slow path.")
+                logger.warning(f"Failed to load cache: {e}. Falling back to Slow Boot.")
         
-        # Slow path: Compute encodings from images
-        logger.info("Computing face encodings from images (this may take a moment)...")
+        # Slow Boot: Compute centroid encodings from images
+        logger.info("Slow Boot: Computing centroid face encodings from images (this may take a moment)...")
         image_extensions = {'.jpg', '.jpeg', '.png', '.bmp'}
+        
+        # Temporary storage for all embeddings per person
+        person_embeddings: dict[str, list[np.ndarray]] = {}
         
         # Iterate through sub-directories (each represents a person)
         for person_dir in dir_path.iterdir():
             if person_dir.is_dir():
                 person_name = person_dir.name
-                images_loaded = 0
+                person_embeddings[person_name] = []
                 
                 # Iterate through all image files in the person's directory
                 for img_file in person_dir.iterdir():
                     if img_file.is_file() and img_file.suffix.lower() in image_extensions:
                         try:
-                            image = face_recognition.load_image_file(str(img_file))
-                            encodings = face_recognition.face_encodings(image)
-                            if encodings:
-                                if len(encodings) > 1:
-                                    logger.warning(f"Multiple faces ({len(encodings)}) found in {img_file.name} for '{person_name}', using first face only")
-                                self.safe_list.append(encodings[0])
-                                self.safe_list_names.append(person_name)
-                                images_loaded += 1
+                            # Load image with OpenCV
+                            image = cv2.imread(str(img_file))
+                            if image is None:
+                                logger.warning(f"Failed to load image {img_file.name} for '{person_name}'")
+                                continue
+                            
+                            # Get faces using InsightFace
+                            faces = self.app.get(image)
+                            if faces:
+                                if len(faces) > 1:
+                                    logger.warning(f"Multiple faces ({len(faces)}) found in {img_file.name} for '{person_name}', using first face only")
+                                # Get normalized embedding
+                                embedding = faces[0].normed_embedding
+                                person_embeddings[person_name].append(embedding)
                                 logger.info(f"Loaded face encoding from {img_file.name} for '{person_name}'")
                             else:
                                 logger.warning(f"No face found in {img_file.name} for '{person_name}'")
                         except Exception as e:
                             logger.error(f"Failed to load {img_file.name} for '{person_name}': {e}")
+        
+        # Compute centroid embeddings for each person
+        for person_name, embeddings in person_embeddings.items():
+            if len(embeddings) > 0:
+                # Calculate mean embedding (centroid)
+                centroid = np.mean(embeddings, axis=0)
+                # Normalize the centroid
+                centroid_norm = np.linalg.norm(centroid)
+                if centroid_norm > 1e-8:  # Robust epsilon check for numerical stability
+                    centroid = centroid / centroid_norm
                 
-                if images_loaded > 0:
-                    logger.info(f"Loaded {images_loaded} face encoding(s) for '{person_name}'")
-                else:
-                    logger.warning(f"No valid face encodings found for '{person_name}'")
+                self.safe_list.append(centroid)
+                self.safe_list_names.append(person_name)
+                logger.info(f"Computed centroid from {len(embeddings)} embedding(s) for '{person_name}'")
+            else:
+                logger.warning(f"No valid face encodings found for '{person_name}'")
         
-        logger.info(f"Safe List initialized with {len(self.safe_list)} authorized face encodings")
+        logger.info(f"Safe List initialized with {len(self.safe_list)} centroid encodings")
         
-        # Serialize encodings to cache for next boot
+        # Serialize centroid encodings to cache for Fast Boot
         if len(self.safe_list) > 0:
             try:
                 cache_data = {
@@ -303,7 +346,7 @@ class TheftDetectionSystem:
                 }
                 with cache_path.open('wb') as cache_file:
                     pickle.dump(cache_data, cache_file)
-                logger.info(f"Cached {len(self.safe_list)} encodings to {cache_path}")
+                logger.info(f"Cached {len(self.safe_list)} centroid encodings to {cache_path}")
             except Exception as e:
                 logger.error(f"Failed to write encodings cache to {cache_path}: {e}. Next boot will recompute encodings.")
     
@@ -326,14 +369,17 @@ class TheftDetectionSystem:
         bbox: tuple[int, int, int, int]
     ) -> Optional[np.ndarray]:
         """
-        Extract face encoding from a person's bounding box region.
+        Extract face encoding from a person's bounding box region with anatomical filtering.
+        
+        Security Hardened: Implements anatomical filtering to reject faces detected on 
+        torso/t-shirts (e.g., printed faces on clothing).
         
         Args:
             frame: The current video frame
             bbox: Person's bounding box (x1, y1, x2, y2)
             
         Returns:
-            Face encoding array or None if no face detected
+            Normalized face embedding array or None if no valid face detected
         """
         x1, y1, x2, y2 = [int(coord) for coord in bbox]
         
@@ -345,26 +391,54 @@ class TheftDetectionSystem:
         if x2 <= x1 or y2 <= y1:
             return None
         
-        # Extract person region
-        person_region = frame[y1:y2, x1:x2]
+        # Extract person region (crop)
+        person_crop = frame[y1:y2, x1:x2]
         
-        if person_region.size == 0:
+        if person_crop.size == 0:
             return None
         
-        # Convert BGR to RGB for face_recognition
-        rgb_region = cv2.cvtColor(person_region, cv2.COLOR_BGR2RGB)
+        crop_height, crop_width = person_crop.shape[:2]
         
-        # Detect and encode faces
-        face_locations = face_recognition.face_locations(rgb_region)
-        if not face_locations:
+        # Detect faces using InsightFace
+        faces = self.app.get(person_crop)
+        
+        if not faces:
             return None
         
-        encodings = face_recognition.face_encodings(rgb_region, face_locations)
-        return encodings[0] if encodings else None
+        # Anatomical Filtering: Reject faces on torso/t-shirts
+        # Only accept faces in the top half of the person crop
+        # Rationale: This prevents false positives from faces printed on clothing.
+        # Assumes typical standing person with overhead/front-facing camera setup.
+        # For seated individuals or non-standard camera angles, this may filter valid faces,
+        # but provides a strong security guarantee against clothing-based spoofing attacks.
+        valid_faces = []
+        for face in faces:
+            # Get face bounding box
+            face_bbox = face.bbox  # [x1, y1, x2, y2]
+            
+            # Calculate center of the face
+            cx = (face_bbox[0] + face_bbox[2]) / 2
+            cy = (face_bbox[1] + face_bbox[3]) / 2
+            
+            # Reject faces where cy > 0.5 * crop_height (bottom half)
+            if cy <= 0.5 * crop_height:
+                valid_faces.append(face)
+        
+        if not valid_faces:
+            return None
+        
+        # From valid faces, select the largest one
+        largest_face = max(valid_faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+        
+        # Return normalized embedding
+        return largest_face.normed_embedding
     
     def _is_in_safe_list(self, face_encoding: np.ndarray) -> tuple[bool, Optional[str]]:
         """
-        Check if face encoding matches any authorized personnel.
+        Check if face encoding matches any authorized personnel using cosine similarity.
+        
+        Args:
+            face_encoding: Normalized face embedding from InsightFace
         
         Returns:
             Tuple of (is_match, person_name) where name is None if no match
@@ -372,21 +446,21 @@ class TheftDetectionSystem:
         if not self.safe_list:
             return False, None
         
-        matches = face_recognition.compare_faces(
-            self.safe_list,
-            face_encoding,
-            tolerance=FACE_MATCH_TOLERANCE
-        )
-        
-        for i, match in enumerate(matches):
-            if match:
+        # Calculate cosine similarity with all safe list embeddings
+        # Since embeddings are normalized, dot product = cosine similarity
+        for i, safe_embedding in enumerate(self.safe_list):
+            similarity = np.dot(face_encoding, safe_embedding)
+            if similarity >= FACE_SIMILARITY_THRESHOLD:
                 return True, self.safe_list_names[i]
         
         return False, None
     
     def _is_in_thief_ledger(self, face_encoding: np.ndarray) -> tuple[bool, int]:
         """
-        Check if face encoding matches any known thief.
+        Check if face encoding matches any known thief using cosine similarity.
+        
+        Args:
+            face_encoding: Normalized face embedding from InsightFace
         
         Returns:
             Tuple of (is_match, index) where index is -1 if no match
@@ -394,14 +468,11 @@ class TheftDetectionSystem:
         if not self.thief_ledger:
             return False, -1
         
-        matches = face_recognition.compare_faces(
-            self.thief_ledger,
-            face_encoding,
-            tolerance=FACE_MATCH_TOLERANCE
-        )
-        
-        for i, match in enumerate(matches):
-            if match:
+        # Calculate cosine similarity with all thief ledger embeddings
+        # Since embeddings are normalized, dot product = cosine similarity
+        for i, thief_embedding in enumerate(self.thief_ledger):
+            similarity = np.dot(face_encoding, thief_embedding)
+            if similarity >= FACE_SIMILARITY_THRESHOLD:
                 return True, i
         
         return False, -1

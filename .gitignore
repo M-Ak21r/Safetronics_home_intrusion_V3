@@ -79,4 +79,5 @@ Thumbs.db
 output*.mp4
 
 # Face encodings cache
+encodings.pkl
 encodings.pickle
