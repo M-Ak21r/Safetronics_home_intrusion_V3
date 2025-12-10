@@ -1090,7 +1090,7 @@ class TheftDetectionSystem:
                         
                         # If too many consecutive failures, attempt reconnection
                         if consecutive_read_failures >= max_consecutive_failures:
-                            raise cv2.error("Consistent frame read failures - triggering reconnection")
+                            raise IOError("Consistent frame read failures - triggering reconnection")
                         
                         continue
                     
@@ -1131,7 +1131,7 @@ class TheftDetectionSystem:
                         logger.info("Quit requested by user")
                         break
                 
-                except (cv2.error, Exception) as e:
+                except (cv2.error, IOError, OSError, Exception) as e:
                     # Log critical error
                     logger.critical(f"Camera error occurred: {e}")
                     
@@ -1148,7 +1148,8 @@ class TheftDetectionSystem:
                     cap = cv2.VideoCapture(self.camera_source)
                     
                     if not cap.isOpened():
-                        logger.error("Failed to reconnect to camera, will retry...")
+                        logger.error("Failed to reconnect to camera, waiting before retry...")
+                        time.sleep(5)  # Additional delay before retrying
                         continue
                     
                     # Re-set camera properties
