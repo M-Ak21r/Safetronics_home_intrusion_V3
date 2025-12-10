@@ -1076,48 +1076,94 @@ class TheftDetectionSystem:
         fps_start_time = time.time()
         fps_frame_count = 0
         current_fps = 0
+        consecutive_read_failures = 0
+        max_consecutive_failures = 10  # Threshold for triggering reconnection
         
         try:
             while True:
-                ret, frame = cap.read()
+                try:
+                    ret, frame = cap.read()
+                    
+                    if not ret:
+                        consecutive_read_failures += 1
+                        logger.warning(f"Failed to read frame (failure {consecutive_read_failures}/{max_consecutive_failures})")
+                        
+                        # If too many consecutive failures, attempt reconnection
+                        if consecutive_read_failures >= max_consecutive_failures:
+                            raise cv2.error("Consistent frame read failures - triggering reconnection")
+                        
+                        continue
+                    
+                    # Reset failure counter on successful read
+                    consecutive_read_failures = 0
+                    
+                    # Process frame
+                    annotated_frame, alerts = self.process_frame(frame, actual_fps)
+                    
+                    # Calculate FPS
+                    fps_frame_count += 1
+                    if fps_frame_count >= 10:
+                        fps_end_time = time.time()
+                        current_fps = fps_frame_count / (fps_end_time - fps_start_time)
+                        fps_start_time = fps_end_time
+                        fps_frame_count = 0
+                    
+                    # Display FPS
+                    cv2.putText(
+                        annotated_frame,
+                        f"FPS: {current_fps:.1f}",
+                        (annotated_frame.shape[1] - 120, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (0, 255, 0),
+                        2
+                    )
+                    
+                    # Show frame
+                    cv2.imshow("Theft Detection System", annotated_frame)
+                    
+                    # Log alerts
+                    for alert in alerts:
+                        logger.critical(f"ALERT: {alert}")
+                    
+                    # Check for quit key
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        logger.info("Quit requested by user")
+                        break
                 
-                if not ret:
-                    logger.warning("Failed to read frame")
-                    continue
-                
-                # Process frame
-                annotated_frame, alerts = self.process_frame(frame, actual_fps)
-                
-                # Calculate FPS
-                fps_frame_count += 1
-                if fps_frame_count >= 10:
-                    fps_end_time = time.time()
-                    current_fps = fps_frame_count / (fps_end_time - fps_start_time)
-                    fps_start_time = fps_end_time
-                    fps_frame_count = 0
-                
-                # Display FPS
-                cv2.putText(
-                    annotated_frame,
-                    f"FPS: {current_fps:.1f}",
-                    (annotated_frame.shape[1] - 120, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (0, 255, 0),
-                    2
-                )
-                
-                # Show frame
-                cv2.imshow("Theft Detection System", annotated_frame)
-                
-                # Log alerts
-                for alert in alerts:
-                    logger.critical(f"ALERT: {alert}")
-                
-                # Check for quit key
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    logger.info("Quit requested by user")
-                    break
+                except (cv2.error, Exception) as e:
+                    # Log critical error
+                    logger.critical(f"Camera error occurred: {e}")
+                    
+                    # Release the camera
+                    logger.info("Releasing camera...")
+                    cap.release()
+                    
+                    # Sleep for 5 seconds before reconnection
+                    logger.info("Waiting 5 seconds before attempting reconnection...")
+                    time.sleep(5)
+                    
+                    # Attempt to re-initialize camera
+                    logger.info(f"Attempting to reconnect to camera {self.camera_source}...")
+                    cap = cv2.VideoCapture(self.camera_source)
+                    
+                    if not cap.isOpened():
+                        logger.error("Failed to reconnect to camera, will retry...")
+                        continue
+                    
+                    # Re-set camera properties
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                    cap.set(cv2.CAP_PROP_FPS, 30)
+                    
+                    # Update FPS
+                    actual_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+                    
+                    # Reset failure counter
+                    consecutive_read_failures = 0
+                    
+                    logger.info("Camera reconnected successfully")
+                    # Continue the loop
         
         finally:
             # Stop any ongoing theft recording
