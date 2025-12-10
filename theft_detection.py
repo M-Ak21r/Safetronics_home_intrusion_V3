@@ -16,6 +16,8 @@ import time
 import logging
 import pickle
 import os
+import threading
+import queue
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional
@@ -56,6 +58,65 @@ CAPTURED_VIDEO = "./capture"
 THEFT_EVIDENCE_DIR = "./theft_evidence"  # Directory to save theft evidence
 VIDEO_BUFFER_SECONDS = 5  # Seconds of video to buffer before theft
 VIDEO_RECORD_AFTER_SECONDS = 10  # Seconds to record after theft detection
+
+
+class EvidenceWriter(threading.Thread):
+    """
+    Asynchronous evidence writer thread for non-blocking disk I/O.
+    
+    Handles image and video frame writes in a separate thread to prevent
+    blocking the main vision loop during critical theft events.
+    """
+    
+    def __init__(self):
+        """Initialize the evidence writer thread."""
+        super().__init__(daemon=True)
+        self.queue = queue.Queue()
+        self._stop_event = threading.Event()
+        
+    def run(self):
+        """Main thread loop to process evidence writing tasks."""
+        while not self._stop_event.is_set():
+            try:
+                # Get task from queue with timeout to check stop event periodically
+                task = self.queue.get(timeout=0.1)
+                
+                if task is None:
+                    # Sentinel value - stop processing
+                    break
+                
+                task_type = task[0]
+                
+                if task_type == 'image':
+                    # Task format: ('image', path, frame)
+                    _, path, frame = task
+                    try:
+                        cv2.imwrite(str(path), frame)
+                        logger.debug(f"Wrote image to {path}")
+                    except Exception as e:
+                        logger.error(f"Failed to write image to {path}: {e}")
+                
+                elif task_type == 'video_frame':
+                    # Task format: ('video_frame', writer, frame)
+                    _, writer, frame = task
+                    try:
+                        writer.write(frame)
+                    except Exception as e:
+                        logger.error(f"Failed to write video frame: {e}")
+                
+                self.queue.task_done()
+                
+            except queue.Empty:
+                # No task available, continue loop
+                continue
+            except Exception as e:
+                logger.error(f"Error in EvidenceWriter thread: {e}")
+    
+    def stop(self):
+        """Signal the thread to stop and wait for it to finish."""
+        self._stop_event.set()
+        self.queue.put(None)  # Sentinel value to unblock queue.get()
+        self.join(timeout=5.0)  # Wait up to 5 seconds for thread to finish
 
 
 @dataclass
@@ -183,6 +244,10 @@ class TheftDetectionSystem:
         # Arduino serial connection for lockdown mechanism
         self.arduino_serial: Optional[serial.Serial] = None
         self._init_arduino_connection(arduino_port, arduino_baudrate)
+        
+        # Initialize and start evidence writer thread
+        self.evidence_writer = EvidenceWriter()
+        self.evidence_writer.start()
         
         logger.info("System initialized successfully")
     
@@ -487,12 +552,12 @@ class TheftDetectionSystem:
             theft_timestamp: Timestamp identifier for this theft event
         """
         try:
-            # Save full frame
+            # Save full frame (async)
             full_frame_path = self.evidence_dir / f"theft_{theft_timestamp}_fullframe.jpg"
-            cv2.imwrite(str(full_frame_path), frame)
-            logger.info(f"Saved theft evidence: {full_frame_path}")
+            self.evidence_writer.queue.put(('image', full_frame_path, frame.copy()))
+            logger.info(f"Queued theft evidence: {full_frame_path}")
             
-            # Save cropped suspect image if available
+            # Save cropped suspect image if available (async)
             if suspect_id in self.person_states:
                 suspect = self.person_states[suspect_id]
                 x1, y1, x2, y2 = [int(coord) for coord in suspect.bbox]
@@ -503,13 +568,13 @@ class TheftDetectionSystem:
                 x2, y2 = min(w, x2), min(h, y2)
                 
                 if x2 > x1 and y2 > y1:
-                    suspect_crop = frame[y1:y2, x1:x2]
+                    suspect_crop = frame[y1:y2, x1:x2].copy()
                     crop_path = self.evidence_dir / f"theft_{theft_timestamp}_suspect_{suspect_id}.jpg"
-                    cv2.imwrite(str(crop_path), suspect_crop)
-                    logger.info(f"Saved suspect image: {crop_path}")
+                    self.evidence_writer.queue.put(('image', crop_path, suspect_crop))
+                    logger.info(f"Queued suspect image: {crop_path}")
         
         except Exception as e:
-            logger.error(f"Failed to capture theft evidence: {e}")
+            logger.error(f"Failed to queue theft evidence: {e}")
     
     def _start_theft_video_recording(self, theft_timestamp: str, fps: float, frame_size: tuple[int, int]) -> None:
         """
@@ -529,9 +594,9 @@ class TheftDetectionSystem:
                 logger.error("Failed to open video writer")
                 return
             
-            # Write buffered frames (pre-theft footage)
+            # Write buffered frames (pre-theft footage) asynchronously
             for buffered_frame in self.frame_buffer:
-                self.video_writer.write(buffered_frame)
+                self.evidence_writer.queue.put(('video_frame', self.video_writer, buffered_frame.copy()))
             
             self.is_recording_theft = True
             self.recording_frames_remaining = int(fps * VIDEO_RECORD_AFTER_SECONDS)
@@ -866,9 +931,9 @@ class TheftDetectionSystem:
         if len(self.frame_buffer) > self.buffer_max_frames:
             self.frame_buffer.pop(0)
         
-        # Write frame to theft video if recording
+        # Write frame to theft video if recording (async)
         if self.is_recording_theft and self.video_writer:
-            self.video_writer.write(frame)
+            self.evidence_writer.queue.put(('video_frame', self.video_writer, frame.copy()))
             self.recording_frames_remaining -= 1
             if self.recording_frames_remaining <= 0:
                 self._stop_theft_video_recording()
@@ -1058,6 +1123,9 @@ class TheftDetectionSystem:
             if self.is_recording_theft:
                 self._stop_theft_video_recording()
             
+            # Stop evidence writer thread
+            self.evidence_writer.stop()
+            
             cap.release()
             cv2.destroyAllWindows()
             logger.info("System shutdown complete")
@@ -1124,6 +1192,9 @@ class TheftDetectionSystem:
                     logger.info(f"Progress: {progress:.1f}%")
         
         finally:
+            # Stop evidence writer thread
+            self.evidence_writer.stop()
+            
             cap.release()
             if out:
                 out.release()
