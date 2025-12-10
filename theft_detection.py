@@ -117,15 +117,24 @@ class TheftDetectionSystem:
         
         # Initialize InsightFace FaceAnalysis
         logger.info("Initializing InsightFace (ArcFace) model...")
-        self.app = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])
+        try:
+            self.app = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+        except Exception as e:
+            logger.error(f"Failed to initialize InsightFace model: {e}")
+            raise RuntimeError(f"Could not load InsightFace buffalo_l model. Please ensure insightface is properly installed: {e}")
+        
         try:
             # Try GPU first (ctx_id=0), fallback to CPU (ctx_id=-1)
             self.app.prepare(ctx_id=0, det_size=(640, 640))
             logger.info("InsightFace initialized with GPU acceleration")
         except Exception as e:
             logger.warning(f"GPU initialization failed: {e}. Falling back to CPU.")
-            self.app.prepare(ctx_id=-1, det_size=(640, 640))
-            logger.info("InsightFace initialized with CPU")
+            try:
+                self.app.prepare(ctx_id=-1, det_size=(640, 640))
+                logger.info("InsightFace initialized with CPU")
+            except Exception as e:
+                logger.error(f"Failed to prepare InsightFace model: {e}")
+                raise RuntimeError(f"Could not prepare InsightFace model for inference: {e}")
         
         # Load YOLO model
         logger.info(f"Loading YOLO model from {model_path}")
@@ -384,6 +393,10 @@ class TheftDetectionSystem:
         
         # Anatomical Filtering: Reject faces on torso/t-shirts
         # Only accept faces in the top half of the person crop
+        # Rationale: This prevents false positives from faces printed on clothing.
+        # Assumes typical standing person with overhead/front-facing camera setup.
+        # For seated individuals or non-standard camera angles, this may filter valid faces,
+        # but provides a strong security guarantee against clothing-based spoofing attacks.
         valid_faces = []
         for face in faces:
             # Get face bounding box
