@@ -326,7 +326,7 @@ class TheftDetectionSystem:
                 centroid = np.mean(embeddings, axis=0)
                 # Normalize the centroid
                 centroid_norm = np.linalg.norm(centroid)
-                if centroid_norm > 0:
+                if centroid_norm > 1e-8:  # Robust epsilon check for numerical stability
                     centroid = centroid / centroid_norm
                 
                 self.safe_list.append(centroid)
