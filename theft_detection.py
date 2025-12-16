@@ -18,15 +18,18 @@ import pickle
 import os
 import threading
 import queue
+import json
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Iterator
 from datetime import datetime
 
 import cv2
 import numpy as np
 from insightface.app import FaceAnalysis
 from ultralytics import YOLO
+from flask import Flask, Response
+import paho.mqtt.client as mqtt
 
 try:
     import serial
@@ -59,6 +62,12 @@ THEFT_EVIDENCE_DIR = "./theft_evidence"  # Directory to save theft evidence
 VIDEO_BUFFER_SECONDS = 5  # Seconds of video to buffer before theft
 VIDEO_RECORD_AFTER_SECONDS = 10  # Seconds to record after theft detection
 THREAD_SHUTDOWN_TIMEOUT = 5.0  # Seconds to wait for thread shutdown
+
+# MQTT Configuration
+MQTT_BROKER = "localhost"  # MQTT broker address
+MQTT_PORT = 1883  # MQTT broker port
+MQTT_TOPIC_EVENTS = "sentinel/level2/events"  # Topic for publishing theft events
+MQTT_TOPIC_COMMANDS = "sentinel/commands"  # Topic for receiving commands
 
 
 class EvidenceWriter(threading.Thread):
@@ -162,7 +171,9 @@ class TheftDetectionSystem:
         camera_source: int = 1,
         evidence_dir: str = THEFT_EVIDENCE_DIR,
         arduino_port: Optional[str] = "COM11",
-        arduino_baudrate: int = 9600
+        arduino_baudrate: int = 9600,
+        mqtt_broker: str = MQTT_BROKER,
+        mqtt_port: int = MQTT_PORT
     ):
         """
         Initialize the theft detection system.
@@ -174,6 +185,8 @@ class TheftDetectionSystem:
             evidence_dir: Directory to save theft evidence (images/videos)
             arduino_port: Serial port for Arduino connection (e.g., '/dev/ttyUSB0', 'COM3')
             arduino_baudrate: Baud rate for Arduino serial communication (default: 9600)
+            mqtt_broker: MQTT broker address
+            mqtt_port: MQTT broker port
         """
         logger.info("Initializing Theft Detection System...")
         
@@ -250,6 +263,10 @@ class TheftDetectionSystem:
         self.evidence_writer = EvidenceWriter()
         self.evidence_writer.start()
         
+        # Initialize MQTT client
+        self.mqtt_client: Optional[mqtt.Client] = None
+        self._init_mqtt_client(mqtt_broker, mqtt_port)
+        
         logger.info("System initialized successfully")
     
     def _init_arduino_connection(self, port: Optional[str], baudrate: int) -> None:
@@ -296,6 +313,125 @@ class TheftDetectionSystem:
             logger.error(f"Failed to send lockdown signal: {e}")
         except Exception as e:
             logger.error(f"Unexpected error sending lockdown signal: {e}")
+    
+    def _init_mqtt_client(self, broker: str, port: int) -> None:
+        """
+        Initialize MQTT client for telemetry and command listening.
+        
+        Args:
+            broker: MQTT broker address
+            port: MQTT broker port
+        """
+        try:
+            # Use CallbackAPIVersion for compatibility with paho-mqtt >= 2.0
+            try:
+                self.mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
+            except AttributeError:
+                # Fallback for older versions of paho-mqtt
+                self.mqtt_client = mqtt.Client()
+            
+            self.mqtt_client.on_connect = self._on_mqtt_connect
+            self.mqtt_client.on_message = self._on_mqtt_message
+            
+            # Connect to broker
+            self.mqtt_client.connect(broker, port, 60)
+            
+            # Start network loop in background thread
+            self.mqtt_client.loop_start()
+            
+            logger.info(f"MQTT client initialized and connected to {broker}:{port}")
+        except Exception as e:
+            logger.warning(f"Failed to initialize MQTT client: {e}. Telemetry disabled.")
+            self.mqtt_client = None
+    
+    def _on_mqtt_connect(self, client, userdata, flags, rc):
+        """
+        Callback when MQTT client connects to broker.
+        
+        Args:
+            client: MQTT client instance
+            userdata: User data (unused)
+            flags: Connection flags
+            rc: Connection result code
+        """
+        if rc == 0:
+            logger.info("MQTT client connected successfully")
+            # Subscribe to commands topic
+            client.subscribe(MQTT_TOPIC_COMMANDS)
+            logger.info(f"Subscribed to {MQTT_TOPIC_COMMANDS}")
+        else:
+            logger.error(f"MQTT connection failed with code {rc}")
+    
+    def _on_mqtt_message(self, client, userdata, msg):
+        """
+        Callback when MQTT message is received.
+        
+        Args:
+            client: MQTT client instance
+            userdata: User data (unused)
+            msg: MQTT message
+        """
+        try:
+            topic = msg.topic
+            payload = msg.payload.decode('utf-8')
+            
+            logger.info(f"MQTT message received on {topic}: {payload}")
+            
+            if topic == MQTT_TOPIC_COMMANDS:
+                # Parse command
+                try:
+                    command = json.loads(payload)
+                    command_type = command.get('command', '').upper()
+                    
+                    if command_type == 'LOCKDOWN':
+                        logger.critical("LOCKDOWN command received via MQTT")
+                        self._trigger_lockdown()
+                    else:
+                        logger.warning(f"Unknown command: {command_type}")
+                except json.JSONDecodeError:
+                    # Try simple string command
+                    if payload.upper() == 'LOCKDOWN':
+                        logger.critical("LOCKDOWN command received via MQTT (simple)")
+                        self._trigger_lockdown()
+                    else:
+                        logger.warning(f"Unrecognized command format: {payload}")
+        except Exception as e:
+            logger.error(f"Error processing MQTT message: {e}")
+    
+    def _publish_mqtt_event(self, event_type: str, suspect_id: int, status: str, metadata: dict = None) -> None:
+        """
+        Publish theft event to MQTT broker.
+        
+        Args:
+            event_type: Type of event ("THEFT" or "SUSPICIOUS_ACTIVITY")
+            suspect_id: Track ID of the suspect
+            status: Alert message/status
+            metadata: Additional metadata (e.g., authorized personnel names)
+        """
+        if self.mqtt_client is None:
+            logger.debug("MQTT client not available, skipping event publish")
+            return
+        
+        try:
+            # Create event payload
+            event_payload = {
+                "type": event_type,
+                "timestamp": datetime.now().isoformat(),
+                "suspect_id": suspect_id,
+                "status": status,
+                "metadata": metadata or {}
+            }
+            
+            # Publish to MQTT
+            json_payload = json.dumps(event_payload)
+            result = self.mqtt_client.publish(MQTT_TOPIC_EVENTS, json_payload, qos=1)
+            
+            if result.rc == mqtt.MQTT_ERR_SUCCESS:
+                logger.info(f"Published event to {MQTT_TOPIC_EVENTS}: {event_type}")
+            else:
+                logger.error(f"Failed to publish MQTT event: {result.rc}")
+        except Exception as e:
+            logger.error(f"Error publishing MQTT event: {e}")
     
     def _load_authorized_personnel(self, directory: str) -> None:
         """
@@ -678,6 +814,15 @@ class TheftDetectionSystem:
             logger.info("No persons in frame to identify as suspect")
             # Still capture evidence of the theft event
             self._capture_theft_evidence(frame, -1, theft_timestamp)
+            
+            # Publish MQTT event
+            self._publish_mqtt_event(
+                event_type="THEFT",
+                suspect_id=-1,
+                status="THEFT DETECTED - No suspect visible",
+                metadata={}
+            )
+            
             return "THEFT DETECTED - No suspect visible"
         
         suspect = self.person_states[suspect_id]
@@ -700,6 +845,15 @@ class TheftDetectionSystem:
             self.confirmed_thief_track_ids.add(suspect_id)
             # Trigger lockdown immediately
             self._trigger_lockdown()
+            
+            # Publish MQTT event
+            self._publish_mqtt_event(
+                event_type="THEFT",
+                suspect_id=suspect_id,
+                status=f"THEFT DETECTED - Suspect {suspect_id} (face not captured)",
+                metadata={}
+            )
+            
             return f"THEFT DETECTED - Suspect {suspect_id} (face not captured)"
         
         # Biometric Cross-Check
@@ -709,6 +863,15 @@ class TheftDetectionSystem:
             suspect.authorized_name = auth_name
             self.authorized_person_names[suspect_id] = auth_name
             logger.info(f"Person {suspect_id} is authorized personnel: {auth_name}")
+            
+            # Publish MQTT event
+            self._publish_mqtt_event(
+                event_type="SUSPICIOUS_ACTIVITY",
+                suspect_id=suspect_id,
+                status=f"Authorized Movement: {auth_name}",
+                metadata={"authorized_personnel": [auth_name]}
+            )
+            
             return f"Authorized Movement: {auth_name}"
         
         # Check 2: Thief Ledger
@@ -721,6 +884,15 @@ class TheftDetectionSystem:
             self.confirmed_thief_track_ids.add(suspect_id)
             # Trigger lockdown immediately
             self._trigger_lockdown()
+            
+            # Publish MQTT event
+            self._publish_mqtt_event(
+                event_type="THEFT",
+                suspect_id=suspect_id,
+                status=f"ALERT: REPEAT OFFENDER - Thief #{thief_index + 1}",
+                metadata={"thief_index": thief_index + 1}
+            )
+            
             return f"ALERT: REPEAT OFFENDER - Thief #{thief_index + 1}"
         else:
             # New thief - add to ledger
@@ -731,6 +903,15 @@ class TheftDetectionSystem:
             logger.critical(f"NEW THIEF detected and added to ledger. Total thieves: {len(self.thief_ledger)}")
             # Trigger lockdown immediately
             self._trigger_lockdown()
+            
+            # Publish MQTT event
+            self._publish_mqtt_event(
+                event_type="THEFT",
+                suspect_id=suspect_id,
+                status=f"ALERT: NEW THIEF DETECTED - Added to Ledger (#{len(self.thief_ledger)})",
+                metadata={"ledger_size": len(self.thief_ledger)}
+            )
+            
             return f"ALERT: NEW THIEF DETECTED - Added to Ledger (#{len(self.thief_ledger)})"
     
     def _periodic_thief_scan(self, frame: np.ndarray) -> list[str]:
@@ -1053,8 +1234,15 @@ class TheftDetectionSystem:
         
         return annotated_frame, alerts
     
-    def run(self) -> None:
-        """Run the theft detection system with live camera feed."""
+    def generate_frames(self) -> Iterator[bytes]:
+        """
+        Generator function for Flask video streaming.
+        
+        Yields JPEG-encoded frames for MJPEG streaming over HTTP.
+        
+        Note: Each client connection creates a new generator instance with its own
+        camera capture. This prevents conflicts between multiple concurrent clients.
+        """
         logger.info(f"Starting camera capture from source {self.camera_source}")
         
         cap = cv2.VideoCapture(self.camera_source)
@@ -1071,13 +1259,8 @@ class TheftDetectionSystem:
         # Get actual FPS
         actual_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         
-        logger.info("Press 'q' to quit")
-        
-        fps_start_time = time.time()
-        fps_frame_count = 0
-        current_fps = 0
         consecutive_read_failures = 0
-        max_consecutive_failures = 10  # Threshold for triggering reconnection
+        max_consecutive_failures = 10
         
         try:
             while True:
@@ -1088,7 +1271,6 @@ class TheftDetectionSystem:
                         consecutive_read_failures += 1
                         logger.warning(f"Failed to read frame (failure {consecutive_read_failures}/{max_consecutive_failures})")
                         
-                        # If too many consecutive failures, attempt reconnection
                         if consecutive_read_failures >= max_consecutive_failures:
                             raise IOError("Consistent frame read failures - triggering reconnection")
                         
@@ -1100,154 +1282,128 @@ class TheftDetectionSystem:
                     # Process frame
                     annotated_frame, alerts = self.process_frame(frame, actual_fps)
                     
-                    # Calculate FPS
-                    fps_frame_count += 1
-                    if fps_frame_count >= 10:
-                        fps_end_time = time.time()
-                        current_fps = fps_frame_count / (fps_end_time - fps_start_time)
-                        fps_start_time = fps_end_time
-                        fps_frame_count = 0
-                    
-                    # Display FPS
-                    cv2.putText(
-                        annotated_frame,
-                        f"FPS: {current_fps:.1f}",
-                        (annotated_frame.shape[1] - 120, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (0, 255, 0),
-                        2
-                    )
-                    
-                    # Show frame
-                    cv2.imshow("Theft Detection System", annotated_frame)
-                    
                     # Log alerts
                     for alert in alerts:
                         logger.critical(f"ALERT: {alert}")
                     
-                    # Check for quit key
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        logger.info("Quit requested by user")
-                        break
-                
-                except (cv2.error, IOError, OSError, Exception) as e:
-                    # Log critical error
-                    logger.critical(f"Camera error occurred: {e}")
+                    # Encode frame as JPEG
+                    ret, buffer = cv2.imencode('.jpg', annotated_frame)
+                    if not ret:
+                        logger.warning("Failed to encode frame")
+                        continue
                     
-                    # Release the camera
-                    logger.info("Releasing camera...")
+                    frame_bytes = buffer.tobytes()
+                    
+                    # Yield frame in MJPEG format
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+                
+                except (cv2.error, IOError, OSError) as e:
+                    logger.critical(f"Camera error occurred: {e}")
                     cap.release()
                     
-                    # Sleep for 5 seconds before reconnection
                     logger.info("Waiting 5 seconds before attempting reconnection...")
                     time.sleep(5)
                     
-                    # Attempt to re-initialize camera
                     logger.info(f"Attempting to reconnect to camera {self.camera_source}...")
                     cap = cv2.VideoCapture(self.camera_source)
                     
                     if not cap.isOpened():
                         logger.error("Failed to reconnect to camera, waiting before retry...")
-                        time.sleep(5)  # Additional delay before retrying
+                        time.sleep(5)
                         continue
                     
-                    # Re-set camera properties
                     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
                     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
                     cap.set(cv2.CAP_PROP_FPS, 30)
-                    
-                    # Update FPS
                     actual_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-                    
-                    # Reset failure counter
                     consecutive_read_failures = 0
-                    
                     logger.info("Camera reconnected successfully")
-                    # Continue the loop
         
+        except GeneratorExit:
+            logger.info("Video stream stopped")
         finally:
-            # Stop any ongoing theft recording
             if self.is_recording_theft:
                 self._stop_theft_video_recording()
-            
-            # Stop evidence writer thread
-            self.evidence_writer.stop()
-            
             cap.release()
-            cv2.destroyAllWindows()
-            logger.info("System shutdown complete")
+            logger.info("Camera released")
     
-    def run_on_video(self, video_path: str, output_path: Optional[str] = None) -> None:
-        """
-        Run the theft detection system on a video file.
+    def cleanup(self) -> None:
+        """Clean up resources before shutdown."""
+        logger.info("Cleaning up resources...")
         
-        Args:
-            video_path: Path to input video file
-            output_path: Optional path to save output video
-        """
-        logger.info(f"Processing video: {video_path}")
+        # Stop any ongoing theft recording
+        if self.is_recording_theft:
+            self._stop_theft_video_recording()
         
-        cap = cv2.VideoCapture(video_path)
+        # Stop evidence writer thread
+        self.evidence_writer.stop()
         
-        if not cap.isOpened():
-            logger.error(f"Failed to open video: {video_path}")
-            raise RuntimeError(f"Could not open video: {video_path}")
+        # Disconnect MQTT client
+        if self.mqtt_client:
+            self.mqtt_client.loop_stop()
+            self.mqtt_client.disconnect()
+            logger.info("MQTT client disconnected")
         
-        # Get video properties
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        logger.info("Cleanup complete")
+
+# Initialize Flask app
+app = Flask(__name__)
+
+# Global system instance with thread lock for safe access
+theft_detection_system: Optional[TheftDetectionSystem] = None
+system_lock = threading.Lock()
+
+
+@app.route('/video_feed')
+def video_feed():
+    """
+    Video streaming route for Flask.
+    Returns a multipart MJPEG response.
+    """
+    # Thread-safe check for system initialization
+    with system_lock:
+        if theft_detection_system is None:
+            return "System not initialized", 500
         
-        logger.info(f"Video: {width}x{height} @ {fps} FPS, {total_frames} frames")
-        
-        # Setup output video writer
-        out = None
-        if output_path:
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-        
-        try:
-            while True:
-                ret, frame = cap.read()
-                
-                if not ret:
-                    break
-                
-                # Process frame
-                annotated_frame, alerts = self.process_frame(frame, fps)
-                
-                # Write to output
-                if out:
-                    out.write(annotated_frame)
-                
-                # Show frame
-                cv2.imshow("Theft Detection System", annotated_frame)
-                
-                # Log alerts
-                for alert in alerts:
-                    logger.critical(f"ALERT: {alert}")
-                
-                # Check for quit key
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    logger.info("Quit requested by user")
-                    break
-                
-                # Progress logging
-                if self.frame_count % 100 == 0:
-                    progress = (self.frame_count / total_frames) * 100
-                    logger.info(f"Progress: {progress:.1f}%")
-        
-        finally:
-            # Stop evidence writer thread
-            self.evidence_writer.stop()
-            
-            cap.release()
-            if out:
-                out.release()
-            cv2.destroyAllWindows()
-            logger.info(f"Processed {self.frame_count} frames")
+        # Note: The generator itself is safe as each client gets its own generator instance
+        return Response(
+            theft_detection_system.generate_frames(),
+            mimetype='multipart/x-mixed-replace; boundary=frame'
+        )
+
+
+@app.route('/')
+def index():
+    """
+    Home route with basic system information.
+    """
+    return """
+    <html>
+        <head>
+            <title>Safetronics Level 2 Security Microservice</title>
+            <style>
+                body { font-family: Arial, sans-serif; margin: 40px; background-color: #f0f0f0; }
+                h1 { color: #333; }
+                .container { background-color: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+                img { width: 100%; max-width: 800px; border: 2px solid #333; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>🔒 Safetronics Level 2 Security Microservice</h1>
+                <h2>Live Video Feed</h2>
+                <img src="/video_feed" alt="Video Feed">
+                <h3>System Status</h3>
+                <ul>
+                    <li>Status: <strong>Active</strong></li>
+                    <li>MQTT Events Topic: <strong>sentinel/level2/events</strong></li>
+                    <li>MQTT Commands Topic: <strong>sentinel/commands</strong></li>
+                </ul>
+            </div>
+        </body>
+    </html>
+    """
 
 
 def main():
@@ -1255,7 +1411,7 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(
-        description="Theft Detection MVP - Real-time security monitoring system"
+        description="Theft Detection MVP - Level 2 Security Microservice"
     )
     parser.add_argument(
         "--model",
@@ -1273,35 +1429,60 @@ def main():
         "--camera",
         type=int,
         default=1,
-        help="Camera device index (default: 0)"
+        help="Camera device index (default: 1)"
     )
     parser.add_argument(
-        "--video",
+        "--mqtt-broker",
         type=str,
-        default=None,
-        help="Path to video file (if not provided, uses camera)"
+        default=MQTT_BROKER,
+        help=f"MQTT broker address (default: {MQTT_BROKER})"
     )
     parser.add_argument(
-        "--output",
+        "--mqtt-port",
+        type=int,
+        default=MQTT_PORT,
+        help=f"MQTT broker port (default: {MQTT_PORT})"
+    )
+    parser.add_argument(
+        "--host",
         type=str,
-        default=CAPTURED_VIDEO,
-        help="Path to save output video (only with --video)"
+        default="0.0.0.0",
+        help="Flask server host (default: 0.0.0.0)"
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=5000,
+        help="Flask server port (default: 5000)"
     )
     
     args = parser.parse_args()
     
-    # Initialize system
-    system = TheftDetectionSystem(
-        model_path=args.model,
-        authorized_dir=args.authorized_dir,
-        camera_source=args.camera
-    )
+    # Initialize system with thread-safe assignment
+    global theft_detection_system
+    with system_lock:
+        theft_detection_system = TheftDetectionSystem(
+            model_path=args.model,
+            authorized_dir=args.authorized_dir,
+            camera_source=args.camera,
+            mqtt_broker=args.mqtt_broker,
+            mqtt_port=args.mqtt_port
+        )
     
-    # Run system
-    if args.video:
-        system.run_on_video(args.video, args.output)
-    else:
-        system.run()
+    logger.info(f"Starting Flask server on {args.host}:{args.port}")
+    logger.info(f"Video feed available at: http://{args.host}:{args.port}/video_feed")
+    logger.warning("Flask development server is running. For production, use a WSGI server like Gunicorn:")
+    logger.warning(f"  gunicorn -w 4 -b {args.host}:{args.port} --timeout 120 theft_detection:app")
+    
+    try:
+        # Run Flask app with threading enabled
+        # Note: For production deployment, use Gunicorn or similar WSGI server
+        app.run(host=args.host, port=args.port, debug=False, threaded=True)
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
+    finally:
+        if theft_detection_system:
+            theft_detection_system.cleanup()
 
 
 if __name__ == "__main__":

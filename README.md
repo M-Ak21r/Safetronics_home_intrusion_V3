@@ -2,6 +2,31 @@
 
 A production-grade theft detection system using computer vision and facial recognition.
 
+## 🚀 New: Level 2 Security Microservice
+
+This system has been refactored to function as a headless "Level 2 Security Microservice" for web-based dashboards.
+
+**Key Features:**
+- 🌐 Flask-based video streaming (MJPEG over HTTP)
+- 📡 MQTT telemetry for real-time event publishing
+- 🎯 Remote command listener (LOCKDOWN via MQTT)
+- 🔒 Headless operation (no GUI required)
+
+**Quick Start:**
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Run the microservice
+python theft_detection.py --camera 0 --mqtt-broker localhost
+
+# Access video feed at http://localhost:5000
+```
+
+**Documentation:** See [MICROSERVICE_README.md](MICROSERVICE_README.md) for detailed information.
+
+---
+
 ## Features
 
 - **Real-time Object Detection**: Uses YOLO11n for detecting and tracking people, phones, and laptops
@@ -13,7 +38,9 @@ A production-grade theft detection system using computer vision and facial recog
 ## Tech Stack
 
 - **Vision Core**: ultralytics (YOLO11n) for object detection & tracking
-- **Biometrics**: face_recognition (dlib) and OpenCV
+- **Biometrics**: insightface (ArcFace) for facial recognition
+- **Web Framework**: Flask for HTTP video streaming
+- **Messaging**: paho-mqtt for event telemetry and remote commands
 - **Math**: NumPy for vector calculations
 
 ## Installation
@@ -28,22 +55,14 @@ Note: You may need to install dlib dependencies first:
 
 ## Usage
 
-### Basic Usage (Webcam)
+### Microservice Mode (Recommended)
 
 ```bash
-python theft_detection.py
-```
+# Start the Level 2 Security Microservice
+python theft_detection.py --camera 0
 
-### With Custom Model
-
-```bash
-python theft_detection.py --model path/to/model.pt
-```
-
-### Process Video File
-
-```bash
-python theft_detection.py --video input.mp4 --output output.mp4
+# Access the web dashboard at http://localhost:5000
+# Video feed available at http://localhost:5000/video_feed
 ```
 
 ### Command Line Options
@@ -52,9 +71,23 @@ python theft_detection.py --video input.mp4 --output output.mp4
 |--------|---------|-------------|
 | `--model` | `yolo11n.pt` | Path to YOLO model weights |
 | `--authorized-dir` | `./authorized_personnel` | Directory with authorized face images |
-| `--camera` | `0` | Camera device index |
-| `--video` | None | Path to input video file |
-| `--output` | None | Path to save output video |
+| `--camera` | `1` | Camera device index |
+| `--mqtt-broker` | `localhost` | MQTT broker address |
+| `--mqtt-port` | `1883` | MQTT broker port |
+| `--host` | `0.0.0.0` | Flask server host |
+| `--port` | `5000` | Flask server port |
+
+### MQTT Integration
+
+Subscribe to events:
+```bash
+mosquitto_sub -h localhost -t sentinel/level2/events
+```
+
+Send LOCKDOWN command:
+```bash
+mosquitto_pub -h localhost -t sentinel/commands -m "LOCKDOWN"
+```
 
 ## System Architecture
 
@@ -98,10 +131,6 @@ authorized_personnel/
 ```
 
 Supported formats: `.jpg`, `.jpeg`, `.png`, `.bmp`
-
-## Controls
-
-- Press `q` to quit the application
 
 ## License
 
