@@ -4,3 +4,5 @@ onnxruntime>=1.16.0
 opencv-python>=4.8.0
 numpy>=1.24.0
 pyserial>=3.5
+flask>=2.3.0
+paho-mqtt>=1.6.0
