@@ -21,7 +21,7 @@ import queue
 import json
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Iterator
 from datetime import datetime
 
 import cv2
@@ -1234,11 +1234,14 @@ class TheftDetectionSystem:
         
         return annotated_frame, alerts
     
-    def generate_frames(self) -> bytes:
+    def generate_frames(self) -> Iterator[bytes]:
         """
         Generator function for Flask video streaming.
         
         Yields JPEG-encoded frames for MJPEG streaming over HTTP.
+        
+        Note: Each client connection creates a new generator instance with its own
+        camera capture. This prevents conflicts between multiple concurrent clients.
         """
         logger.info(f"Starting camera capture from source {self.camera_source}")
         
@@ -1468,9 +1471,12 @@ def main():
     
     logger.info(f"Starting Flask server on {args.host}:{args.port}")
     logger.info(f"Video feed available at: http://{args.host}:{args.port}/video_feed")
+    logger.warning("Flask development server is running. For production, use a WSGI server like Gunicorn:")
+    logger.warning(f"  gunicorn -w 4 -b {args.host}:{args.port} --timeout 120 theft_detection:app")
     
     try:
         # Run Flask app with threading enabled
+        # Note: For production deployment, use Gunicorn or similar WSGI server
         app.run(host=args.host, port=args.port, debug=False, threaded=True)
     except KeyboardInterrupt:
         logger.info("Shutting down...")
