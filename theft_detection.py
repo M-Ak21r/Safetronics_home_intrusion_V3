@@ -323,7 +323,13 @@ class TheftDetectionSystem:
             port: MQTT broker port
         """
         try:
-            self.mqtt_client = mqtt.Client()
+            # Use CallbackAPIVersion for compatibility with paho-mqtt >= 2.0
+            try:
+                self.mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
+            except AttributeError:
+                # Fallback for older versions of paho-mqtt
+                self.mqtt_client = mqtt.Client()
+            
             self.mqtt_client.on_connect = self._on_mqtt_connect
             self.mqtt_client.on_message = self._on_mqtt_message
             
@@ -1338,12 +1344,12 @@ class TheftDetectionSystem:
         
         logger.info("Cleanup complete")
 
-
 # Initialize Flask app
 app = Flask(__name__)
 
-# Global system instance
+# Global system instance with thread lock for safe access
 theft_detection_system: Optional[TheftDetectionSystem] = None
+system_lock = threading.Lock()
 
 
 @app.route('/video_feed')
@@ -1352,13 +1358,16 @@ def video_feed():
     Video streaming route for Flask.
     Returns a multipart MJPEG response.
     """
-    if theft_detection_system is None:
-        return "System not initialized", 500
-    
-    return Response(
-        theft_detection_system.generate_frames(),
-        mimetype='multipart/x-mixed-replace; boundary=frame'
-    )
+    # Thread-safe check for system initialization
+    with system_lock:
+        if theft_detection_system is None:
+            return "System not initialized", 500
+        
+        # Note: The generator itself is safe as each client gets its own generator instance
+        return Response(
+            theft_detection_system.generate_frames(),
+            mimetype='multipart/x-mixed-replace; boundary=frame'
+        )
 
 
 @app.route('/')
@@ -1446,18 +1455,19 @@ def main():
     
     args = parser.parse_args()
     
-    # Initialize system
+    # Initialize system with thread-safe assignment
     global theft_detection_system
-    theft_detection_system = TheftDetectionSystem(
-        model_path=args.model,
-        authorized_dir=args.authorized_dir,
-        camera_source=args.camera,
-        mqtt_broker=args.mqtt_broker,
-        mqtt_port=args.mqtt_port
-    )
+    with system_lock:
+        theft_detection_system = TheftDetectionSystem(
+            model_path=args.model,
+            authorized_dir=args.authorized_dir,
+            camera_source=args.camera,
+            mqtt_broker=args.mqtt_broker,
+            mqtt_port=args.mqtt_port
+        )
     
     logger.info(f"Starting Flask server on {args.host}:{args.port}")
-    logger.info("Video feed available at: http://{args.host}:{args.port}/video_feed")
+    logger.info(f"Video feed available at: http://{args.host}:{args.port}/video_feed")
     
     try:
         # Run Flask app with threading enabled
